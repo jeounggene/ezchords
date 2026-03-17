@@ -25,19 +25,32 @@ import numpy as np
 
 # Client fallback order — try least-restricted first
 _YT_CLIENTS = ['ANDROID_VR', 'IOS', 'ANDROID', 'WEB', 'TV', 'WEB_MUSIC', 'MWEB']
+_YT_MAX_RETRIES = 3          # retry the entire client chain this many times
+_YT_BASE_DELAY  = 5          # seconds before first retry (doubled each round)
 
 
 def _youtube(url: str) -> YouTube:
-    """Create a YouTube object, trying multiple clients until one works."""
+    """Create a YouTube object, trying multiple clients with exponential backoff."""
     last_err = None
-    for client in _YT_CLIENTS:
-        try:
-            yt = YouTube(url, client=client)
-            _ = yt.title  # force metadata fetch to detect errors early
-            return yt
-        except Exception as e:
-            last_err = e
-            print(f'[pytubefix] client {client} failed: {str(e)[:80]}')
+    for attempt in range(_YT_MAX_RETRIES):
+        if attempt > 0:
+            delay = _YT_BASE_DELAY * (2 ** (attempt - 1))
+            print(f'[pytubefix] 429 backoff: waiting {delay}s before retry #{attempt + 1}')
+            time.sleep(delay)
+        for client in _YT_CLIENTS:
+            try:
+                yt = YouTube(url, client=client)
+                _ = yt.title  # force metadata fetch to detect errors early
+                return yt
+            except Exception as e:
+                last_err = e
+                is_429 = '429' in str(e)
+                print(f'[pytubefix] client {client} failed: {str(e)[:80]}')
+                # On 429, skip remaining clients and go straight to backoff
+                if is_429:
+                    break
+                # Small pause between client switches to avoid hammering
+                time.sleep(1)
     raise RuntimeError(f'All YouTube clients failed. Last error: {last_err}')
 
 app = Flask(__name__)
@@ -609,9 +622,9 @@ def _process_job(job_id: str, url: str):
             dur = yt_length if 'yt_length' in dir() else None
             lyrics = _fetch_lrclib(track or title, artist, dur)
             if not lyrics:
-                # Fallback: pytubefix captions
+                # Fallback: pytubefix captions (reuse existing yt object if available)
                 try:
-                    yt_obj = _youtube(url) if 'yt' not in dir() else yt
+                    yt_obj = yt if 'yt' in dir() and yt else _youtube(url)
                     lyrics = _fetch_captions_pytubefix(yt_obj)
                 except Exception as e:
                     print(f'[lyrics] caption fallback failed: {e}')
