@@ -404,8 +404,47 @@ def _viterbi_decode(template_matrix, chord_list, beat_chroma, self_prob=0.92,
     return [chord_list[ci] for ci in path]
 
 
+# ─────────────────────────────────────────────
+# Essentia-based chord detection (subprocess with Python 3.12)
+# ─────────────────────────────────────────────
+_VENV312_PYTHON = os.path.join(os.path.dirname(__file__), '.venv312', 'bin', 'python')
+_ANALYZE_SCRIPT = os.path.join(os.path.dirname(__file__), 'analyze_chords.py')
+
+
+def _detect_chords_essentia(audio_path: str):
+    """Call the Essentia analysis script in the 3.12 venv. Returns (chords, bpm, key, beat_times)."""
+    import subprocess
+    result = subprocess.run(
+        [_VENV312_PYTHON, _ANALYZE_SCRIPT, audio_path],
+        capture_output=True, text=True, timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'Essentia analysis failed: {result.stderr[-500:]}')
+    data = json.loads(result.stdout)
+    if 'error' in data:
+        raise RuntimeError(data['error'])
+    return data['chords'], data['bpm'], data['key'], data['beat_times']
+
+
 def detect_chords(audio_path: str, hop_size: float = 0.5):
     """Return (chords_list, bpm, key_string, beat_times_list).
+
+    Tries Essentia (via Python 3.12 subprocess) first for best accuracy.
+    Falls back to librosa CENS + HMM pipeline if Essentia is unavailable.
+    """
+    # ── Try Essentia first ──
+    if os.path.exists(_VENV312_PYTHON) and os.path.exists(_ANALYZE_SCRIPT):
+        try:
+            return _detect_chords_essentia(audio_path)
+        except Exception as e:
+            print(f'[EZChords] Essentia failed, falling back to librosa: {e}')
+
+    # ── Fallback: librosa CENS + Viterbi HMM ──
+    return _detect_chords_librosa(audio_path, hop_size)
+
+
+def _detect_chords_librosa(audio_path: str, hop_size: float = 0.5):
+    """Fallback librosa-based chord detection.
 
     Pipeline:
       1) HPSS → harmonic chroma (CENS) + percussive beat tracking

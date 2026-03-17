@@ -12,17 +12,14 @@
 'use strict';
 
 // ─── State ────────────────────────────────────────────────
-let ytPlayer       = null;
-let isYTReady      = false;
-let pendingVideoId = null;
-let audioEl        = null;   // <audio> element used when embedding is blocked
-let currentVideoId = null;   // always reflects the video currently loaded in the YT player
+let audioEl        = null;   // <audio> element for playback
+let currentVideoId = null;
 
 let chords     = [];        // [{chord, start, end}, …]
 let beatTimes  = [];        // [t0, t1, …] seconds
 let bpm        = 120;
 let baseKey    = '';        // original detected key
-let transposeSteps = 0;     // semitones offset from original
+let transposeSteps = 0;     // semitones offset from original (chord labels only)
 let playbackRate   = 1.0;   // current playback speed
 
 let lyricsLines = [];       // [{text, start, end}, …] from server
@@ -119,11 +116,14 @@ function transposeChord(chord, steps) {
   return transposeNote(m[1], steps) + m[2];
 }
 
+function totalTranspose() { return transposeSteps; }
+
 function transposeLabel(steps) {
   if (steps === 0) return 'Original key';
   const abs = Math.abs(steps);
   const dir = steps > 0 ? '▲' : '▼';
-  return `${dir} ${abs} semitone${abs > 1 ? 's' : ''}`;
+  const capo = steps < 0 ? ` (Capo ${abs})` : '';
+  return `${dir} ${abs} semitone${abs > 1 ? 's' : ''}${capo}`;
 }
 
 const SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5];
@@ -131,7 +131,6 @@ const SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5];
 function setSpeed(rate) {
   playbackRate = rate;
   if (audioEl) audioEl.playbackRate = rate;
-  if (ytPlayer && ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(rate);
   document.getElementById('speedLabel').textContent =
     rate === 1 ? 'Normal speed' : `Speed: ${rate}×`;
 }
@@ -139,15 +138,20 @@ function setSpeed(rate) {
 function applyTranspose(steps) {
   transposeSteps = steps;
   document.getElementById('transposeLabel').textContent = transposeLabel(steps);
+  _refreshChordDisplay();
+}
+
+function _refreshChordDisplay() {
+  const tt = totalTranspose();
   if (baseKey) {
-    document.getElementById('keyBadge').textContent = `Key: ${transposeChord(baseKey, steps)}`;
+    document.getElementById('keyBadge').textContent = `Key: ${transposeChord(baseKey, tt)}`;
   }
   if (currentIdx >= 0) _setCardContent_beatChord(currentIdx);
   // Re-label beat-block name spans
   document.querySelectorAll('#tlRow .beat-block-name').forEach(el => {
     const bi = +el.closest('.beat-block').dataset.bi;
     const gi = beatChords.findIndex(bc => bc.beatStart === bi);
-    if (gi >= 0) el.textContent = formatChord(transposeChord(beatChords[gi].chord, steps));
+    if (gi >= 0) el.textContent = formatChord(transposeChord(beatChords[gi].chord, tt));
   });
 }
 
@@ -356,55 +360,14 @@ function showOnly(sectionId) {
   });
 }
 
-// ─── YouTube IFrame API ───────────────────────────────────
+// ─── Audio Player ─────────────────────────────────────────
 
-// Called automatically by the YouTube script when it's ready
-window.onYouTubeIframeAPIReady = function () {
-  isYTReady = true;
-  if (pendingVideoId) {
-    createPlayer(pendingVideoId);
-    pendingVideoId = null;
-  }
-};
-
-function createPlayer(videoId) {
-  currentVideoId = videoId;   // update before any async events can fire
-  _hideAudioPlayer();
-  if (ytPlayer) {
-    ytPlayer.loadVideoById(videoId);
-    return;
-  }
-  ytPlayer = new YT.Player('yt-player', {
-    width: '100%',
-    videoId,
-    playerVars: { autoplay: 1, controls: 1, rel: 0, origin: window.location.origin },
-    events: {
-      onReady: (e) => { e.target.playVideo(); startTracking(); },
-      onStateChange: (e) => {
-        if (e.data === YT.PlayerState.PLAYING) startTracking();
-        if (e.data === YT.PlayerState.PAUSED || e.data === YT.PlayerState.ENDED) {
-          stopTracking();
-        }
-      },
-      onError: (e) => {
-        // 101 & 150 = embedding disabled by video owner
-        // Use currentVideoId (not closure var) so subsequent loadVideoById calls work correctly
-        if (e.data === 100 || e.data === 101 || e.data === 150) {
-          _showAudioPlayer(currentVideoId);
-        }
-      },
-    },
-  });
-}
-
-function _showAudioPlayer(videoId) {
-  document.getElementById('playerWrapper').classList.add('hidden');
-  const panel = document.getElementById('audioPlayerPanel');
-  panel.classList.remove('hidden');
-  document.getElementById('apYtLink').href = `https://www.youtube.com/watch?v=${videoId}`;
-
+function initAudioPlayer(videoId) {
+  currentVideoId = videoId;
   audioEl = document.getElementById('audioEl');
-  audioEl.src = `/api/audio/${videoId}`;
+  const src = `/api/audio/${videoId}`;
+  audioEl.src = src;
+  audioEl.playbackRate = playbackRate;
 
   audioEl.addEventListener('play',  () => startTracking(), { once: false });
   audioEl.addEventListener('pause', () => stopTracking(),  { once: false });
@@ -412,15 +375,6 @@ function _showAudioPlayer(videoId) {
   audioEl.addEventListener('seeked', () => { currentIdx = -1; beatIdx = 0; }, { once: false });
 
   audioEl.play().catch(() => {});
-}
-
-function _hideAudioPlayer() {
-  audioEl = null;
-  document.getElementById('playerWrapper').classList.remove('hidden');
-  document.getElementById('audioPlayerPanel').classList.add('hidden');
-  const el = document.getElementById('audioEl');
-  el.pause();
-  el.src = '';
 }
 
 // ─── Timeline ────────────────────────────────────────────
@@ -457,14 +411,13 @@ function renderTimeline() {
     if (bc && bc.beatStart === bi) {
       const name = document.createElement('span');
       name.className   = 'beat-block-name';
-      name.textContent = formatChord(transposeChord(bc.chord, transposeSteps));
+      name.textContent = formatChord(transposeChord(bc.chord, totalTranspose()));
       div.appendChild(name);
     }
 
     div.addEventListener('click', () => {
       const t = beatTimes[bi];
       if (audioEl) { audioEl.currentTime = t; audioEl.play(); }
-      else if (ytPlayer && ytPlayer.seekTo) { ytPlayer.seekTo(t, true); ytPlayer.playVideo(); }
     });
     row.appendChild(div);
   });
@@ -509,7 +462,7 @@ function _setCardContent(idx) {
   ].forEach(({ id, i }) => {
     const el = document.getElementById(id);
     const c  = chords[i];
-    const t  = c ? transposeChord(c.chord, transposeSteps) : null;
+    const t  = c ? transposeChord(c.chord, totalTranspose()) : null;
     el.querySelector('.chord-name').textContent  = t ? formatChord(t) : '';
     el.querySelector('.chord-diagram').innerHTML = t ? buildChordSVG(t) : '';
   });
@@ -531,7 +484,7 @@ function _setCardContent_beatChord(bci) {
   ].forEach(({ id, i }) => {
     const el = document.getElementById(id);
     const bc = beatChords[i];
-    const t  = bc ? transposeChord(bc.chord, transposeSteps) : null;
+    const t  = bc ? transposeChord(bc.chord, totalTranspose()) : null;
     el.querySelector('.chord-name').textContent  = t ? formatChord(t) : '';
     el.querySelector('.chord-diagram').innerHTML = t ? buildChordSVG(t) : '';
   });
@@ -543,9 +496,6 @@ function _seekToChord(i) {
   if (audioEl) {
     audioEl.currentTime = t;
     audioEl.play();
-  } else if (ytPlayer && ytPlayer.seekTo) {
-    ytPlayer.seekTo(t, true);
-    ytPlayer.playVideo();
   }
 }
 
@@ -614,8 +564,6 @@ function trackLoop() {
   let t;
   if (audioEl && !audioEl.paused) {
     t = audioEl.currentTime;
-  } else if (ytPlayer && typeof ytPlayer.getCurrentTime === 'function') {
-    t = ytPlayer.getCurrentTime();
   } else {
     rafId = requestAnimationFrame(trackLoop);
     return;
@@ -645,9 +593,8 @@ function trackLoop() {
 function startTracking() {
   stopTracking();
   beatIdx = 0;
-  // Fast-forward beatIdx to current time
-  if (ytPlayer && ytPlayer.getCurrentTime) {
-    const t = ytPlayer.getCurrentTime();
+  if (audioEl) {
+    const t = audioEl.currentTime;
     while (beatIdx < beatTimes.length && beatTimes[beatIdx] < t) beatIdx++;
   }
   rafId = requestAnimationFrame(trackLoop);
@@ -762,12 +709,8 @@ function loadResults(data) {
 
   showOnly('resultsSection');
 
-  // Init or reload the player
-  if (isYTReady) {
-    createPlayer(data.video_id);
-  } else {
-    pendingVideoId = data.video_id;
-  }
+  // Init audio player
+  initAudioPlayer(data.video_id);
 }
 
 // ─── UI Helpers ───────────────────────────────────────────
@@ -781,13 +724,13 @@ function resetToInput() {
   stopTracking();
   stopPolling();
   if (_lyricsPollTimer) { clearTimeout(_lyricsPollTimer); _lyricsPollTimer = null; }
-  if (ytPlayer) { try { ytPlayer.stopVideo(); } catch (_) {} }
-  _hideAudioPlayer();
+  if (audioEl) { audioEl.pause(); audioEl.src = ''; }
+  audioEl = null;
   chords = []; beatTimes = []; currentIdx = -1;
   lyricsLines = []; lyricsIdx = -1;
   document.getElementById('lyricsSection').classList.add('hidden');
   showOnly('inputSection');
-  loadCachedList(); // refresh in case a new song was just analyzed
+  loadCachedList();
 }
 
 // ─── Boot ─────────────────────────────────────────────────

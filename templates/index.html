@@ -5,8 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>EZChords – Singalong Chord Player</title>
   <link rel="stylesheet" href="/static/css/style.css" />
-  <!-- YouTube IFrame API must load before app.js defines the ready callback -->
-  <script src="https://www.youtube.com/iframe_api"></script>
 </head>
 <body>
 
@@ -85,6 +83,7 @@
           <span class="transpose-label" id="transposeLabel">Original key</span>
           <button class="transpose-btn" id="transposeUp" title="Up one semitone">▲</button>
         </div>
+
         <div class="transpose-ctrl">
           <button class="transpose-btn" id="speedDown" title="Slower">▼</button>
           <span class="transpose-label" id="speedLabel">Normal speed</span>
@@ -127,18 +126,8 @@
         </div>
       </div>
 
-      <!-- Embedded YouTube player -->
-      <div class="player-wrapper" id="playerWrapper">
-        <div id="yt-player"></div>
-      </div>
-
-      <!-- Fallback when embedding is blocked by video owner -->
-      <div id="audioPlayerPanel" class="audio-player-panel hidden">
-        <div class="ap-header">
-          <span class="ap-icon">🎵</span>
-          <span class="ap-label">Audio playback (video embedding disabled by uploader)</span>
-          <a id="apYtLink" href="#" target="_blank" rel="noopener" class="ap-yt-link">▶ Watch on YouTube</a>
-        </div>
+      <!-- Audio player -->
+      <div id="audioPlayerPanel" class="audio-player-panel">
         <audio id="audioEl" controls preload="auto"></audio>
       </div>
 

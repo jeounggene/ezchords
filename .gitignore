@@ -12,6 +12,7 @@ build/
 # Virtual environments
 venv/
 .venv/
+.venv312/
 env/
 
 # Flask / app data
