@@ -25,6 +25,12 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 _COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 if not os.path.exists(_COOKIES_PATH):
     _COOKIES_PATH = '/etc/secrets/cookies.txt'  # Render secret file mount
+# If cookies are provided via env var (base64-encoded), write them to disk
+if not os.path.exists(_COOKIES_PATH) and os.environ.get('YT_COOKIES_B64'):
+    import base64
+    _COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+    with open(_COOKIES_PATH, 'wb') as f:
+        f.write(base64.b64decode(os.environ['YT_COOKIES_B64']))
 
 def _audio_path(video_id: str) -> str:
     return os.path.join(AUDIO_DIR, f'{video_id}.mp3')
