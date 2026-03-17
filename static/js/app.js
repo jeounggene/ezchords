@@ -1,10 +1,10 @@
 /* EZChords – frontend logic
  *
  * Flow:
- *  1. User pastes YouTube URL → thumbnail preview shown
- *  2. "Analyze" clicked → POST /api/analyze → job starts
+ *  1. User uploads audio file
+ *  2. "Analyze" clicked → POST /api/analyze-upload → job starts
  *  3. Poll /api/status/<jobId> every 2 s until done
- *  4. Render chord items, init YouTube player
+ *  4. Render chord items, init HTML audio playback
  *  5. rAF loop: sync chord track to player current time
  *  6. Beat pulse: advance through beat_times for visual feedback
  */
@@ -12,9 +12,12 @@
 'use strict';
 
 // ─── State ────────────────────────────────────────────────
-let ytPlayer       = null;   // YT.Player instance
-let ytReady        = false;  // true once onPlayerReady fires
-let currentVideoId = null;
+let uploadAudioEl  = null;   // HTMLAudioElement for uploaded file playback
+let youtubePlayer  = null;
+let youtubeReady   = false;
+let playbackMode   = 'none'; // none | upload | youtube
+let lastUploadedObjectUrl = '';
+let lastUploadedDurationSec = 0;
 
 let chords     = [];        // [{chord, start, end}, …]
 let beatTimes  = [];        // [t0, t1, …] seconds
@@ -74,7 +77,7 @@ function extractVideoId(url) {
     /^([a-zA-Z0-9_-]{11})$/,
   ];
   for (const p of pats) {
-    const m = url.match(p);
+    const m = (url || '').match(p);
     if (m) return m[1];
   }
   return null;
@@ -84,6 +87,13 @@ function formatChord(raw) {
   return raw
     .replace(/([A-G])#/, '$1♯')
     .replace(/([A-G])b/, '$1♭');
+}
+
+function setSourceWarning(message = '') {
+  const el = document.getElementById('sourceWarning');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle('hidden', !message);
 }
 
 // ─── Transposition ────────────────────────────────────────
@@ -131,7 +141,10 @@ const SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5];
 
 function setSpeed(rate) {
   playbackRate = rate;
-  if (ytPlayer && ytReady) ytPlayer.setPlaybackRate(rate);
+  if (playbackMode === 'upload' && uploadAudioEl) uploadAudioEl.playbackRate = rate;
+  if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+    try { youtubePlayer.setPlaybackRate(rate); } catch (_) {}
+  }
   document.getElementById('speedLabel').textContent =
     rate === 1 ? 'Normal speed' : `Speed: ${rate}×`;
 }
@@ -361,49 +374,85 @@ function showOnly(sectionId) {
   });
 }
 
-// ─── YouTube IFrame Player ────────────────────────────────
+// ─── Audio Helpers ───────────────────────────────────────
 
-// Called automatically by the YouTube IFrame API once loaded.
-// We may call initYTPlayer() before or after this fires, so we use a flag.
-let ytAPIReady = false;
+function _currentTime() {
+  if (playbackMode === 'upload' && uploadAudioEl) return uploadAudioEl.currentTime || 0;
+  if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+    try { return youtubePlayer.getCurrentTime() || 0; } catch (_) { return 0; }
+  }
+  return 0;
+}
+
+function _duration() {
+  if (playbackMode === 'upload' && uploadAudioEl) return uploadAudioEl.duration || 0;
+  if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+    try { return youtubePlayer.getDuration() || 0; } catch (_) { return 0; }
+  }
+  return 0;
+}
+
+function _fmtTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+
+function initUploadedAudio(audioUrl) {
+  const el = document.getElementById('uploadAudio');
+  if (!el) return;
+
+  playbackMode = 'upload';
+  document.getElementById('yt-player').classList.add('hidden');
+
+  uploadAudioEl = el;
+  uploadAudioEl.src = audioUrl;
+  uploadAudioEl.currentTime = 0;
+  uploadAudioEl.playbackRate = playbackRate;
+
+  uploadAudioEl.onloadedmetadata = () => {
+    document.getElementById('seekBar').max = uploadAudioEl.duration || 0;
+    document.getElementById('timeDisplay').textContent = `0:00 / ${_fmtTime(uploadAudioEl.duration || 0)}`;
+  };
+
+  uploadAudioEl.onplay = () => {
+    document.getElementById('playPauseBtn').textContent = '⏸';
+    startTracking();
+  };
+  uploadAudioEl.onpause = () => {
+    document.getElementById('playPauseBtn').textContent = '▶';
+  };
+  uploadAudioEl.onended = () => {
+    document.getElementById('playPauseBtn').textContent = '▶';
+    stopTracking();
+  };
+
+  uploadAudioEl.play().catch(() => {});
+}
+
 window.onYouTubeIframeAPIReady = function () {
-  ytAPIReady = true;
-  if (currentVideoId) _createPlayer(currentVideoId);
+  youtubeReady = true;
 };
 
-function initYTPlayer(videoId) {
-  currentVideoId = videoId;
-  ytReady = false;
+function initYoutubeStream(videoId) {
+  if (!videoId) return;
 
-  // Destroy any previous player instance
-  if (ytPlayer) { try { ytPlayer.destroy(); } catch (_) {} ytPlayer = null; }
-
-  // Ensure the target div exists (YT.Player.destroy removes it)
-  _ensurePlayerDiv();
-
-  // Update custom controls
-  document.getElementById('playPauseBtn').textContent = '▶';
-  document.getElementById('timeDisplay').textContent = '0:00 / 0:00';
-  document.getElementById('seekBar').value = 0;
-
-  if (ytAPIReady) {
-    _createPlayer(videoId);
+  playbackMode = 'youtube';
+  if (uploadAudioEl) {
+    uploadAudioEl.pause();
+    uploadAudioEl.src = '';
   }
-  // else: onYouTubeIframeAPIReady will call _createPlayer once the API loads
-}
 
-function _ensurePlayerDiv() {
-  if (document.getElementById('yt-player')) return;
-  const panel = document.getElementById('audioPlayerPanel');
-  const controls = panel.querySelector('.player-controls');
-  const div = document.createElement('div');
-  div.id = 'yt-player';
-  panel.insertBefore(div, controls);
-}
+  const container = document.getElementById('yt-player');
+  container.classList.remove('hidden');
 
-function _createPlayer(videoId) {
-  ytPlayer = new YT.Player('yt-player', {
-    videoId: videoId,
+  if (youtubePlayer) {
+    try { youtubePlayer.destroy(); } catch (_) {}
+    youtubePlayer = null;
+  }
+
+  youtubePlayer = new YT.Player('yt-player', {
+    videoId,
     height: '0',
     width: '0',
     playerVars: {
@@ -416,55 +465,24 @@ function _createPlayer(videoId) {
       playsinline: 1,
     },
     events: {
-      onReady: _onPlayerReady,
-      onStateChange: _onPlayerStateChange,
+      onReady: (event) => {
+        youtubeReady = true;
+        try { event.target.setPlaybackRate(playbackRate); } catch (_) {}
+        event.target.playVideo();
+        document.getElementById('seekBar').max = _duration();
+        document.getElementById('playPauseBtn').textContent = '⏸';
+        startTracking();
+      },
+      onStateChange: (event) => {
+        if (event.data === YT.PlayerState.PLAYING) {
+          document.getElementById('playPauseBtn').textContent = '⏸';
+          startTracking();
+        } else if (event.data === YT.PlayerState.PAUSED || event.data === YT.PlayerState.ENDED) {
+          document.getElementById('playPauseBtn').textContent = '▶';
+        }
+      },
     },
   });
-}
-
-function _onPlayerReady(event) {
-  ytReady = true;
-  event.target.setPlaybackRate(playbackRate);
-  event.target.playVideo();
-  startTracking();
-
-  // Update seek bar range
-  const dur = event.target.getDuration();
-  document.getElementById('seekBar').max = dur;
-}
-
-function _onPlayerStateChange(event) {
-  const btn = document.getElementById('playPauseBtn');
-  if (event.data === YT.PlayerState.PLAYING) {
-    btn.textContent = '⏸';
-    startTracking();
-  } else if (event.data === YT.PlayerState.PAUSED) {
-    btn.textContent = '▶';
-  } else if (event.data === YT.PlayerState.ENDED) {
-    btn.textContent = '▶';
-    stopTracking();
-  }
-}
-
-// Helper: current playback time (safe to call even when player not ready)
-function _currentTime() {
-  if (ytPlayer && ytReady && typeof ytPlayer.getCurrentTime === 'function') {
-    return ytPlayer.getCurrentTime();
-  }
-  return 0;
-}
-
-function _duration() {
-  if (ytPlayer && ytReady && typeof ytPlayer.getDuration === 'function') {
-    return ytPlayer.getDuration();
-  }
-  return 0;
-}
-
-function _fmtTime(s) {
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return m + ':' + (sec < 10 ? '0' : '') + sec;
 }
 
 // ─── Timeline ────────────────────────────────────────────
@@ -507,7 +525,14 @@ function renderTimeline() {
 
     div.addEventListener('click', () => {
       const t = beatTimes[bi];
-      if (ytPlayer && ytReady) { ytPlayer.seekTo(t, true); ytPlayer.playVideo(); }
+      if (playbackMode === 'upload' && uploadAudioEl) {
+        uploadAudioEl.currentTime = t;
+        uploadAudioEl.play().catch(() => {});
+      }
+      if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+        youtubePlayer.seekTo(t, true);
+        youtubePlayer.playVideo();
+      }
     });
     row.appendChild(div);
   });
@@ -583,9 +608,13 @@ function _setCardContent_beatChord(bci) {
 function _seekToChord(i) {
   if (i < 0 || i >= chords.length) return;
   const t = chords[i].start;
-  if (ytPlayer && ytReady) {
-    ytPlayer.seekTo(t, true);
-    ytPlayer.playVideo();
+  if (playbackMode === 'upload' && uploadAudioEl) {
+    uploadAudioEl.currentTime = t;
+    uploadAudioEl.play().catch(() => {});
+  }
+  if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+    youtubePlayer.seekTo(t, true);
+    youtubePlayer.playVideo();
   }
 }
 
@@ -651,14 +680,23 @@ function findChordAt(t) {
 }
 
 function trackLoop() {
-  if (!ytPlayer || !ytReady) {
-    rafId = requestAnimationFrame(trackLoop);
-    return;
-  }
-
-  // Only sync while playing
-  const state = ytPlayer.getPlayerState();
-  if (state !== YT.PlayerState.PLAYING) {
+  if (playbackMode === 'upload') {
+    if (!uploadAudioEl || uploadAudioEl.paused) {
+      rafId = requestAnimationFrame(trackLoop);
+      return;
+    }
+  } else if (playbackMode === 'youtube') {
+    if (!youtubePlayer || !youtubeReady) {
+      rafId = requestAnimationFrame(trackLoop);
+      return;
+    }
+    let state = -1;
+    try { state = youtubePlayer.getPlayerState(); } catch (_) {}
+    if (state !== YT.PlayerState.PLAYING) {
+      rafId = requestAnimationFrame(trackLoop);
+      return;
+    }
+  } else {
     rafId = requestAnimationFrame(trackLoop);
     return;
   }
@@ -694,7 +732,7 @@ function trackLoop() {
 function startTracking() {
   stopTracking();
   beatIdx = 0;
-  if (ytPlayer && ytReady) {
+  if (playbackMode === 'upload' || playbackMode === 'youtube') {
     const t = _currentTime();
     while (beatIdx < beatTimes.length && beatTimes[beatIdx] < t) beatIdx++;
   }
@@ -787,15 +825,8 @@ function loadResults(data) {
   // Clear any previous lyrics poll
   if (_lyricsPollTimer) { clearTimeout(_lyricsPollTimer); _lyricsPollTimer = null; }
 
-  // Apply lyrics from job data if present, else fetch from API
-  if (data.lyrics && data.lyrics.length) {
-    _applyLyrics(data.lyrics);
-  } else if (data.video_id) {
-    _applyLyrics([]);
-    _pollLyrics(data.video_id);
-  } else {
-    _applyLyrics([]);
-  }
+  if (data.lyrics && data.lyrics.length) _applyLyrics(data.lyrics);
+  else _applyLyrics([]);
 
   document.getElementById('songTitle').textContent   = data.title || '—';
   document.getElementById('keyBadge').textContent    = `Key: ${data.key || '—'}`;
@@ -809,9 +840,15 @@ function loadResults(data) {
   }
 
   showOnly('resultsSection');
-
-  // Init YouTube player
-  initYTPlayer(data.video_id);
+  if (data.audio_url) {
+    initUploadedAudio(data.audio_url);
+  } else if (data.video_id) {
+    initYoutubeStream(data.video_id);
+  } else if (lastUploadedObjectUrl) {
+    initUploadedAudio(lastUploadedObjectUrl);
+  } else {
+    playbackMode = 'none';
+  }
 }
 
 // ─── UI Helpers ───────────────────────────────────────────
@@ -825,39 +862,51 @@ function resetToInput() {
   stopTracking();
   stopPolling();
   if (_lyricsPollTimer) { clearTimeout(_lyricsPollTimer); _lyricsPollTimer = null; }
-  if (ytPlayer) { try { ytPlayer.destroy(); } catch (_) {} ytPlayer = null; }
-  ytReady = false;
+  if (uploadAudioEl) {
+    uploadAudioEl.pause();
+    uploadAudioEl.src = '';
+    uploadAudioEl = null;
+  }
+  if (youtubePlayer) {
+    try { youtubePlayer.destroy(); } catch (_) {}
+    youtubePlayer = null;
+  }
+  document.getElementById('yt-player').classList.add('hidden');
+  playbackMode = 'none';
   chords = []; beatTimes = []; currentIdx = -1;
   lyricsLines = []; lyricsIdx = -1;
   document.getElementById('lyricsSection').classList.add('hidden');
-  _ensurePlayerDiv();
+  document.getElementById('thumbPreview').classList.add('hidden');
+  document.getElementById('playPauseBtn').textContent = '▶';
+  document.getElementById('timeDisplay').textContent = '0:00 / 0:00';
+  document.getElementById('seekBar').value = 0;
   showOnly('inputSection');
-  loadCachedList();
 }
 
 // ─── Boot ─────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
-
-  const urlInput   = document.getElementById('youtubeUrl');
+  const fileInput  = document.getElementById('audioFile');
+  const titleInput = document.getElementById('songTitleInput');
   const analyzeBtn = document.getElementById('analyzeBtn');
+  const loadByYoutubeBtn = document.getElementById('loadByYoutubeBtn');
   const thumbPrev  = document.getElementById('thumbPreview');
-  const thumbImg   = document.getElementById('thumbImg');
+  const uploadLabel = document.getElementById('uploadLabel');
 
-  // Live thumbnail preview
-  urlInput.addEventListener('input', () => {
-    const vid = extractVideoId(urlInput.value.trim());
-    if (vid) {
-      thumbImg.src = `https://img.youtube.com/vi/${vid}/mqdefault.jpg`;
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (f) {
+      uploadLabel.textContent = `${f.name} (${Math.max(1, Math.round(f.size / 1024 / 1024))} MB)`;
       thumbPrev.classList.remove('hidden');
     } else {
+      uploadLabel.textContent = 'No file selected';
       thumbPrev.classList.add('hidden');
     }
   });
 
-  // Analyze button
-  analyzeBtn.addEventListener('click', submitUrl);
-  urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitUrl(); });
+  analyzeBtn.addEventListener('click', submitUpload);
+  loadByYoutubeBtn.addEventListener('click', loadCachedByYoutube);
+  titleInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitUpload(); });
 
   document.getElementById('retryBtn').addEventListener('click', resetToInput);
   document.getElementById('newSongBtn').addEventListener('click', resetToInput);
@@ -880,140 +929,152 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Custom player controls
   document.getElementById('playPauseBtn').addEventListener('click', () => {
-    if (!ytPlayer || !ytReady) return;
-    const state = ytPlayer.getPlayerState();
-    if (state === YT.PlayerState.PLAYING) {
-      ytPlayer.pauseVideo();
-    } else {
-      ytPlayer.playVideo();
+    if (playbackMode === 'upload' && uploadAudioEl) {
+      if (uploadAudioEl.paused) uploadAudioEl.play().catch(() => {});
+      else uploadAudioEl.pause();
+      return;
+    }
+    if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+      const st = youtubePlayer.getPlayerState();
+      if (st === YT.PlayerState.PLAYING) youtubePlayer.pauseVideo();
+      else youtubePlayer.playVideo();
     }
   });
 
   const seekBar = document.getElementById('seekBar');
   seekBar.addEventListener('input', () => {
-    if (ytPlayer && ytReady) ytPlayer.seekTo(Number(seekBar.value), true);
+    if (playbackMode === 'upload' && uploadAudioEl) {
+      uploadAudioEl.currentTime = Number(seekBar.value);
+      return;
+    }
+    if (playbackMode === 'youtube' && youtubePlayer && youtubeReady) {
+      youtubePlayer.seekTo(Number(seekBar.value), true);
+    }
   });
-
-  // Load cached songs list on page load
-  loadCachedList();
 });
 
-async function submitUrl() {
-  const url = document.getElementById('youtubeUrl').value.trim();
-  if (!url) return;
+async function submitUpload() {
+  const fileInput = document.getElementById('audioFile');
+  const titleInput = document.getElementById('songTitleInput');
+  const youtubeInput = document.getElementById('youtubeLinkInput');
+  const rightsConfirm = document.getElementById('rightsConfirm');
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) {
+    showError('Please choose an audio file first.');
+    return;
+  }
+  if (rightsConfirm && !rightsConfirm.checked) {
+    showError('Confirm that you have rights or permission to upload this audio.');
+    return;
+  }
 
-  if (!extractVideoId(url)) {
-    showError('That doesn\'t look like a valid YouTube URL. Please try again.');
+  if (lastUploadedObjectUrl) {
+    URL.revokeObjectURL(lastUploadedObjectUrl);
+    lastUploadedObjectUrl = '';
+  }
+  lastUploadedObjectUrl = URL.createObjectURL(f);
+  setSourceWarning('');
+
+  try {
+    const tempAudio = new Audio();
+    tempAudio.src = lastUploadedObjectUrl;
+    await new Promise((resolve, reject) => {
+      tempAudio.onloadedmetadata = () => resolve();
+      tempAudio.onerror = () => reject(new Error('metadata-failed'));
+    });
+    lastUploadedDurationSec = tempAudio.duration || 0;
+  } catch (_) {
+    lastUploadedDurationSec = 0;
+  }
+
+  const sourceUrl = youtubeInput.value.trim();
+  if (sourceUrl && lastUploadedDurationSec > 0) {
+    try {
+      const metaRes = await fetch(`/api/source-metadata?url=${encodeURIComponent(sourceUrl)}`);
+      const meta = await metaRes.json();
+      if (metaRes.ok && meta.duration) {
+        const delta = Math.abs(Number(meta.duration) - Number(lastUploadedDurationSec));
+        if (delta > 8) {
+          setSourceWarning(`Playback source duration differs from uploaded audio by about ${Math.round(delta)} seconds. Chord timing may not line up perfectly.`);
+        }
+      }
+    } catch (_) {
+      // Non-blocking metadata check.
+    }
+  }
+
+  showOnly('loadingSection');
+  document.getElementById('loadingMessage').textContent = 'Uploading…';
+  document.getElementById('loadingProgress').style.width = '0%';
+
+  try {
+    const form = new FormData();
+    form.append('file', f);
+    form.append('title', titleInput.value.trim());
+    form.append('source_url', sourceUrl);
+
+    const res = await fetch('/api/analyze-upload', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json();
+    if (data.error) {
+      showError(data.error);
+      return;
+    }
+    startPolling(data.job_id);
+  } catch (_) {
+    showError('Could not upload the file.');
+  }
+}
+
+async function loadCachedByYoutube() {
+  const youtubeInput = document.getElementById('youtubeLinkInput');
+  const url = (youtubeInput.value || '').trim();
+  const videoId = extractVideoId(url);
+  setSourceWarning('');
+  if (!videoId) {
+    showError('Enter a valid YouTube URL to load cached chords.');
     return;
   }
 
   showOnly('loadingSection');
-  document.getElementById('loadingMessage').textContent = 'Starting…';
-  document.getElementById('loadingProgress').style.width = '0%';
+  document.getElementById('loadingMessage').textContent = 'Loading cached chords…';
+  document.getElementById('loadingProgress').style.width = '15%';
 
   try {
-    const res  = await fetch('/api/analyze', {
+    const res = await fetch('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
     const data = await res.json();
-
-    if (data.error) { showError(data.error); return; }
-
-    if (data.cached) {
-      // Already analyzed — fetch result directly
-      const res2  = await fetch(`/api/status/${data.job_id}`);
-      const data2 = await res2.json();
-      if (data2.status === 'done') { loadResults(data2); return; }
+    if (!res.ok || data.error) {
+      showError(data.error || 'No cached chords found for that video.');
+      return;
     }
 
-    startPolling(data.job_id);
-  } catch (err) {
-    showError('Could not reach the server. Is the Flask app running?');
+    const statusRes = await fetch(`/api/status/${data.job_id}`);
+    const status = await statusRes.json();
+    if (status.status === 'done') loadResults(status);
+    else showError(status.message || 'Could not load cached chords.');
+  } catch (_) {
+    showError('Could not load cached chords right now.');
   }
 }
 
-// ─── Cached Songs Panel ───────────────────────────────────
+// ─── Cached Songs Panel (disabled in upload mode) ─────────────────────────
 
 async function loadCachedList() {
-  try {
-    const res   = await fetch('/api/cached');
-    const songs = await res.json();
-    renderCachedList(songs);
-  } catch (_) { /* server not available yet */ }
+  return;
 }
 
 function renderCachedList(songs) {
-  const section = document.getElementById('cachedSection');
-  const list    = document.getElementById('cachedList');
-  if (!songs || songs.length === 0) {
-    section.classList.add('hidden');
-    return;
-  }
-
-  section.classList.remove('hidden');
-  list.innerHTML = '';
-
-  songs.forEach(song => {
-    const item = document.createElement('div');
-    item.className = 'cached-item';
-
-    const thumb = document.createElement('img');
-    thumb.src = `https://img.youtube.com/vi/${song.video_id}/mqdefault.jpg`;
-    thumb.alt = song.title;
-    thumb.loading = 'lazy';
-
-    const meta = document.createElement('div');
-    meta.className = 'cached-item-meta';
-    meta.innerHTML = `
-      <div class="cached-item-title" title="${escHtml(song.title)}">${escHtml(song.title)}</div>
-      <div class="cached-item-sub">Key: ${escHtml(song.key)} &nbsp;·&nbsp; ${song.bpm} BPM</div>
-    `;
-
-    const del = document.createElement('button');
-    del.className  = 'cached-item-del';
-    del.title = 'Remove from cache';
-    del.textContent = '✕';
-    del.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      await fetch(`/api/cached/${song.video_id}`, { method: 'DELETE' });
-      item.remove();
-      if (list.children.length === 0) {
-        document.getElementById('cachedSection').classList.add('hidden');
-      }
-    });
-
-    item.appendChild(thumb);
-    item.appendChild(meta);
-    item.appendChild(del);
-
-    item.addEventListener('click', () => loadCachedSong(song.video_id));
-    list.appendChild(item);
-  });
+  return;
 }
 
 async function loadCachedSong(videoId) {
-  showOnly('loadingSection');
-  document.getElementById('loadingMessage').textContent = 'Loading from cache…';
-  document.getElementById('loadingProgress').style.width = '80%';
-
-  try {
-    const res  = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}` }),
-    });
-    const data = await res.json();
-    if (data.error) { showError(data.error); return; }
-
-    const res2  = await fetch(`/api/status/${data.job_id}`);
-    const data2 = await res2.json();
-    if (data2.status === 'done') { loadResults(data2); }
-    else { startPolling(data.job_id); }
-  } catch (err) {
-    showError('Could not reach the server.');
-  }
+  return;
 }
 
 function escHtml(str) {

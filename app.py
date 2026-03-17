@@ -23,91 +23,41 @@ from pytubefix import YouTube
 import librosa
 import numpy as np
 
-# Client fallback order — try least-restricted first
 _YT_CLIENTS = ['ANDROID_VR', 'IOS', 'ANDROID', 'WEB', 'TV', 'WEB_MUSIC', 'MWEB']
 _YT_MAX_RETRIES = 2          # retry the entire client chain this many times
 _YT_BASE_DELAY  = 5          # seconds before first retry (doubled each round)
 
-
-def _youtube(url: str) -> YouTube:
-    """Create a YouTube object, trying multiple clients with exponential backoff."""
-    last_err = None
-    for attempt in range(_YT_MAX_RETRIES):
-        if attempt > 0:
-            delay = _YT_BASE_DELAY * (2 ** (attempt - 1))
-            print(f'[pytubefix] 429 backoff: waiting {delay}s before retry #{attempt + 1}')
-            time.sleep(delay)
-        for client in _YT_CLIENTS:
-            try:
-                yt = YouTube(url, client=client)
-                _ = yt.title  # force metadata fetch to detect errors early
-                return yt
-            except Exception as e:
-                last_err = e
-                is_429 = '429' in str(e)
-                print(f'[pytubefix] client {client} failed: {str(e)[:80]}')
-                # On 429, skip remaining clients and go straight to backoff
-                if is_429:
-                    break
-                # Small pause between client switches to avoid hammering
-                time.sleep(1)
-    raise RuntimeError(f'All YouTube clients failed. Last error: {last_err}')
-
-
-def _ytdlp_download(url: str, output_dir: str) -> tuple:
-    """Fallback: download audio via yt-dlp with browser cookies.
-    Returns (audio_file_path, title, author, duration) or raises."""
-    import shutil as _sh
-    ytdlp = _sh.which('yt-dlp')
-    if not ytdlp:
-        raise RuntimeError('yt-dlp not installed')
-
-    out_template = os.path.join(output_dir, '%(title)s.%(ext)s')
-    cmd = [
-        ytdlp,
-        '--cookies-from-browser', 'chrome',
-        '-x', '--audio-format', 'mp3',
-        '--audio-quality', '128K',
-        '-o', out_template,
-        '--print', 'after_move:filepath',
-        '--print', '%(title)s',
-        '--print', '%(uploader)s',
-        '--print', '%(duration)s',
-        '--no-playlist',
-        '--no-warnings',
-        url,
-    ]
-    print(f'[yt-dlp] fallback download: {url}')
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if result.returncode != 0:
-        raise RuntimeError(f'yt-dlp failed: {result.stderr[:200]}')
-
-    lines = result.stdout.strip().split('\n')
-    if len(lines) < 4:
-        raise RuntimeError(f'yt-dlp unexpected output: {result.stdout[:200]}')
-
-    filepath = lines[0]
-    title    = lines[1] or 'Unknown Song'
-    author   = lines[2] or ''
-    try:
-        duration = int(float(lines[3]))
-    except (ValueError, IndexError):
-        duration = None
-
-    if not os.path.exists(filepath):
-        raise RuntimeError(f'yt-dlp output file not found: {filepath}')
-
-    return filepath, title, author, duration
-
 app = Flask(__name__)
 
 DB_PATH    = os.path.join(os.path.dirname(__file__), 'cache.db')
-AUDIO_DIR  = os.path.join(os.path.dirname(__file__), 'static', 'audio')
-os.makedirs(AUDIO_DIR, exist_ok=True)
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'static', 'uploads')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-def _audio_path(video_id: str) -> str:
-    return os.path.join(AUDIO_DIR, f'{video_id}.mp3')
+def _upload_audio_path(upload_id: str) -> str:
+    return os.path.join(UPLOAD_DIR, f'{upload_id}.mp3')
+
+
+def _clean_title(name: str) -> str:
+    title = re.sub(r'\.[A-Za-z0-9]{1,6}$', '', (name or '').strip())
+    title = re.sub(r'[_\-]+', ' ', title).strip()
+    return title[:120] if title else 'Uploaded Audio'
+
+
+def _youtube_metadata(url: str):
+    last_err = None
+    for client in _YT_CLIENTS:
+        try:
+            yt = YouTube(url, client=client)
+            _ = yt.title
+            return {
+                'title': yt.title or '',
+                'duration': int(yt.length or 0),
+                'video_id': getattr(yt, 'video_id', '') or extract_video_id(url),
+            }
+        except Exception as exc:
+            last_err = exc
+    raise RuntimeError(f'Could not fetch source metadata: {last_err}')
 
 # ─────────────────────────────────────────────
 # SQLite persistent cache
@@ -612,138 +562,62 @@ def _detect_chords_librosa(audio_path: str, hop_size: float = 0.5):
     return merged, tempo, key, beat_times
 
 
-# ─────────────────────────────────────────────
-# Background worker
-# ─────────────────────────────────────────────
-
-def _process_job(job_id: str, url: str):
-    tmp_dir = tempfile.mkdtemp()
+def _process_upload_job(job_id: str, source_path: str, source_name: str):
+    """Analyze a user-uploaded audio file, persist only chord data, then delete audio."""
+    temp_mp3 = _upload_audio_path(job_id)
     try:
-        _set_job(job_id, status='processing', progress=5, message='Initializing…')
+        _set_job(job_id, status='processing', progress=5, message='Preparing uploaded audio…')
 
-        video_id = extract_video_id(url)
-        mp3_dest  = _audio_path(video_id)
+        if not shutil.which('ffmpeg'):
+            raise RuntimeError('FFmpeg is required to process uploaded files.')
 
-        # ── Download (skip if we already have the audio on disk) ──
-        if os.path.exists(mp3_dest):
-            _set_job(job_id, message='Audio already cached, skipping download…', progress=30)
-            title_from_cache = (_cache_get(video_id) or {}).get('title', 'Unknown Song')
-            title = title_from_cache
-        else:
-            _set_job(job_id, message='Downloading audio from YouTube…', progress=10)
+        subprocess.run(
+            [
+                'ffmpeg', '-i', source_path,
+                '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k',
+                temp_mp3, '-y',
+            ],
+            capture_output=True, timeout=180,
+        )
+        if not os.path.exists(temp_mp3):
+            raise RuntimeError('Failed to convert uploaded file to mp3.')
 
-            # Try pytubefix first, fall back to yt-dlp with browser cookies
-            try:
-                yt = _youtube(url)
-                title = yt.title or 'Unknown Song'
-                yt_author = yt.author or ''
-                yt_length = yt.length
+        _set_job(job_id, status='processing', progress=40, message='Analyzing chords…')
+        chords, bpm, key, beat_times = detect_chords(temp_mp3)
 
-                stream = (yt.streams.filter(only_audio=True, mime_type='audio/mp4')
-                            .order_by('abr').last()
-                          or yt.streams.filter(only_audio=True).order_by('abr').last())
-                if not stream:
-                    raise RuntimeError('No audio stream available for this video.')
+        source_url = (_get_job(job_id).get('source_url') or '').strip()
+        video_id = extract_video_id(source_url) if source_url else None
+        title = _clean_title(source_name)
 
-                tmp_audio = stream.download(output_path=tmp_dir, filename='audio')
+        if video_id:
+            _cache_put(video_id, title, key, round(bpm, 1), chords, beat_times, lyrics=[])
 
-                tmp_mp3 = os.path.join(tmp_dir, 'audio.mp3')
-                subprocess.run(
-                    ['ffmpeg', '-i', tmp_audio, '-vn', '-ar', '44100',
-                     '-ac', '2', '-b:a', '128k', tmp_mp3, '-y'],
-                    capture_output=True, timeout=120,
-                )
-                if not os.path.exists(tmp_mp3):
-                    raise RuntimeError('FFmpeg conversion to mp3 failed.')
-
-            except Exception as ptf_err:
-                print(f'[download] pytubefix failed: {ptf_err}')
-                _set_job(job_id, message='Retrying download with yt-dlp…', progress=15)
-                tmp_mp3_path, title, yt_author, yt_length = _ytdlp_download(url, tmp_dir)
-                # yt-dlp already outputs mp3, just use it
-                tmp_mp3 = tmp_mp3_path
-
-            shutil.copy2(tmp_mp3, mp3_dest)
-
-        # ── Fetch lyrics via LRCLIB (then fall back to YT subtitles) ──
-        _pre   = _cache_get(video_id)
-        lyrics = (_pre.get('lyrics') or []) if _pre else []
-        if not lyrics:
-            _set_job(job_id, message='Fetching lyrics…', progress=38)
-            artist, track = _split_title(title)
-            if 'yt_author' in dir():
-                artist = yt_author or artist
-            dur = yt_length if 'yt_length' in dir() else None
-            lyrics = _fetch_lrclib(track or title, artist, dur)
-            if not lyrics:
-                # Fallback: pytubefix captions (reuse existing yt object if available)
-                try:
-                    yt_obj = yt if 'yt' in dir() and yt else _youtube(url)
-                    lyrics = _fetch_captions_pytubefix(yt_obj)
-                except Exception as e:
-                    print(f'[lyrics] caption fallback failed: {e}')
-
-        _set_job(job_id, message='Analyzing chords (this takes ~30–60 s)…', progress=40)
-
-        # If chord data already in SQLite (e.g. audio-only re-download), skip analysis
-        existing = _cache_get(video_id)
-        if existing:
-            # Persist newly-fetched lyrics into the cache if they were missing
-            if lyrics and not (existing.get('lyrics') or []):
-                _cache_put(video_id, existing['title'], existing['key'], existing['bpm'],
-                           existing['chords'], existing['beat_times'], lyrics)
-            _set_job(
-                job_id,
-                status='done',
-                progress=100,
-                title=existing['title'],
-                chords=existing['chords'],
-                bpm=existing['bpm'],
-                key=existing['key'],
-                beat_times=existing['beat_times'],
-                lyrics=lyrics or existing.get('lyrics') or [],
-                video_id=video_id,
-                has_audio=True,
-            )
-        else:
-            chords, bpm, key, beat_times = detect_chords(mp3_dest)
-
-            # ── Persist metadata to SQLite ────────────────────────────────────
-            _cache_put(video_id, title, key, round(bpm, 1), chords, beat_times, lyrics)
-
-            _set_job(
-                job_id,
-                status='done',
-                progress=100,
-                title=title,
-                chords=chords,
-                bpm=round(bpm, 1),
-                key=key,
-                beat_times=beat_times,
-                lyrics=lyrics,
-                video_id=video_id,
-                has_audio=True,
-            )
-
+        _set_job(
+            job_id,
+            status='done',
+            progress=100,
+            title=title,
+            chords=chords,
+            bpm=round(bpm, 1),
+            key=key,
+            beat_times=beat_times,
+            lyrics=[],
+            video_id=video_id,
+            source_url=source_url,
+            has_audio=False,
+        )
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        _set_job(job_id, status='error', message=f'Analysis failed: {exc}')
+        _set_job(job_id, status='error', message=f'Upload analysis failed: {exc}')
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def _fetch_captions_pytubefix(yt_obj) -> list:
-    """Extract English captions from a pytubefix YouTube object → [{text, start, end}, ...]."""
-    cap = None
-    for code in ['en', 'a.en', 'en-US', 'en-GB']:
-        cap = yt_obj.captions.get(code)
-        if cap:
-            break
-    if not cap:
-        return []
-    srt = cap.generate_srt_captions()
-    return _parse_srt(srt)
+        try:
+            if os.path.exists(source_path):
+                os.remove(source_path)
+            if os.path.exists(temp_mp3):
+                os.remove(temp_mp3)
+        except Exception:
+            pass
 
 
 def _parse_srt(srt_text: str) -> list:
@@ -773,28 +647,6 @@ def _parse_srt(srt_text: str) -> list:
     return cues
 
 
-def _fetch_lyrics_job(video_id: str, url: str):
-    """Background job: fetch lyrics via LRCLIB (fallback: YT captions) and update SQLite."""
-    try:
-        cached = _cache_get(video_id)
-        if not cached:
-            return
-        title  = cached.get('title', '')
-        artist, track = _split_title(title)
-        lyrics = _fetch_lrclib(track or title, artist)
-        if not lyrics:
-            try:
-                yt_obj = _youtube(url)
-                lyrics = _fetch_captions_pytubefix(yt_obj)
-            except Exception as e:
-                print(f'[lyrics] pytubefix caption fallback failed: {e}')
-        if lyrics:
-            _cache_put(video_id, cached['title'], cached['key'], cached['bpm'],
-                       cached['chords'], cached['beat_times'], lyrics)
-    except Exception as e:
-        print(f'[lyrics] background fetch failed: {e}')
-
-
 # ─────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────
@@ -804,96 +656,67 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/source-metadata')
+def source_metadata():
+    source_url = request.args.get('url', '').strip()
+    if not source_url:
+        return jsonify({'error': 'Missing source URL.'}), 400
+    try:
+        meta = _youtube_metadata(source_url)
+        return jsonify(meta)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
+    """Return cached chord data for a YouTube URL if available; does not download audio."""
     data = request.get_json(silent=True) or {}
     url = data.get('url', '').strip()
 
     video_id = extract_video_id(url)
     if not video_id:
-        return jsonify({'error': 'Invalid YouTube URL — could not extract video ID.'}), 400
+        return jsonify({'error': 'Invalid YouTube URL.'}), 400
 
-    # ── 1. Check persistent SQLite cache ────────────────────────────────────
     cached = _cache_get(video_id)
     if cached:
-        if os.path.exists(_audio_path(video_id)):
-            # Chord data + audio both ready — return instantly
-            cached['has_audio'] = True
-            job_id = 'cache:' + video_id
-            _set_job(job_id, **cached)
-            return jsonify({'job_id': job_id, 'cached': True})
-        else:
-            # Chord data exists but mp3 missing (analyzed before audio-saving was added).
-            # Start a lightweight background job that only downloads the audio.
-            job_id = str(uuid.uuid4())
-            _set_job(job_id, status='processing', progress=0,
-                     message='Downloading audio (chord data already cached)…')
-            t = threading.Thread(target=_process_job, args=(job_id, url), daemon=True)
-            t.start()
-            return jsonify({'job_id': job_id, 'video_id': video_id, 'cached': False})
+        cached['has_audio'] = False
+        cached['source_url'] = url
+        job_id = 'cache:' + video_id
+        _set_job(job_id, **cached)
+        return jsonify({'job_id': job_id, 'cached': True})
 
-    # ── 2. Check in-memory jobs (already running or finished this session) ─
-    with _jobs_lock:
-        for jid, job in _jobs.items():
-            if job.get('status') == 'done' and job.get('video_id') == video_id:
-                return jsonify({'job_id': jid, 'cached': True})
+    return jsonify({'error': 'No cached chords for this video yet. Upload an MP3 first and include its YouTube link.'}), 404
 
-    # ── 3. Start a new background job ─────────────────────────────────────
+
+@app.route('/api/analyze-upload', methods=['POST'])
+def analyze_upload():
+    file_obj = request.files.get('file')
+    if not file_obj or not file_obj.filename:
+        return jsonify({'error': 'Please choose an audio file to upload.'}), 400
+
+    filename = file_obj.filename.strip()
+    ext = os.path.splitext(filename)[1].lower()
+    allowed = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'}
+    if ext and ext not in allowed:
+        return jsonify({'error': 'Unsupported file type. Upload mp3, wav, m4a, aac, ogg, or flac.'}), 400
+
     job_id = str(uuid.uuid4())
-    _set_job(job_id, status='processing', progress=0, message='Queued…')
+    _set_job(job_id, status='processing', progress=0, message='Upload received…')
 
-    t = threading.Thread(target=_process_job, args=(job_id, url), daemon=True)
+    source_ext = ext if ext else '.bin'
+    source_path = os.path.join(UPLOAD_DIR, f'{job_id}_source{source_ext}')
+    file_obj.save(source_path)
+
+    source_url = request.form.get('source_url', '').strip() or request.form.get('youtube_url', '').strip()
+    if source_url:
+        _set_job(job_id, source_url=source_url)
+
+    title = request.form.get('title', '').strip() or filename
+    t = threading.Thread(target=_process_upload_job, args=(job_id, source_path, title), daemon=True)
     t.start()
 
-    return jsonify({'job_id': job_id, 'video_id': video_id, 'cached': False})
-
-
-@app.route('/api/cached')
-def cached_songs():
-    """List all previously analyzed songs from the persistent cache."""
-    return jsonify(_cache_list())
-
-
-@app.route('/api/audio/<video_id>')
-def serve_audio(video_id):
-    """Stream the stored mp3 for in-browser playback."""
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id):
-        return jsonify({'error': 'Invalid video ID.'}), 400
-    path = _audio_path(video_id)
-    if not os.path.exists(path):
-        return jsonify({'error': 'Audio not found.'}), 404
-    return send_file(path, mimetype='audio/mpeg', conditional=True)
-
-
-@app.route('/api/lyrics/<video_id>')
-def get_lyrics(video_id):
-    """Return stored lyrics. If none exist, kick off a background fetch."""
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id):
-        return jsonify({'error': 'Invalid video ID.'}), 400
-    cached = _cache_get(video_id)
-    if not cached:
-        return jsonify({'lyrics': [], 'status': 'no_song'}), 404
-    lyrics = cached.get('lyrics') or []
-    if not lyrics:
-        # Trigger a background fetch so next poll will have results
-        url = f'https://www.youtube.com/watch?v={video_id}'
-        t = threading.Thread(target=_fetch_lyrics_job, args=(video_id, url), daemon=True)
-        t.start()
-        return jsonify({'lyrics': [], 'status': 'fetching'})
-    return jsonify({'lyrics': lyrics, 'status': 'ok'})
-
-
-@app.route('/api/cached/<video_id>', methods=['DELETE'])
-def delete_cached(video_id):
-    """Remove a song from the cache."""
-    # Sanitize: video IDs are exactly 11 alphanumeric/dash/underscore chars
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id):
-        return jsonify({'error': 'Invalid video ID.'}), 400
-    con = sqlite3.connect(DB_PATH)
-    con.execute('DELETE FROM songs WHERE video_id = ?', (video_id,))
-    con.commit()
-    con.close()
-    return jsonify({'deleted': video_id})
+    return jsonify({'job_id': job_id, 'cached': False})
 
 
 @app.route('/api/status/<job_id>')
@@ -911,7 +734,7 @@ def health():
         'ffmpeg_available': ffmpeg_ok,
         'venv312_path': _VENV312_PYTHON,
         'analyze_script': _ANALYZE_SCRIPT,
-        'audio_dir': AUDIO_DIR,
+        'upload_dir': UPLOAD_DIR,
     })
 
 

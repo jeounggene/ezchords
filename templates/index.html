@@ -12,40 +12,41 @@
   <header class="site-header">
     <div class="header-inner">
       <span class="logo">🎸 EZChords</span>
-      <span class="tagline">Singalong chord player for any YouTube song</span>
+      <span class="tagline">Music analysis and chord learning tool for uploaded songs</span>
     </div>
   </header>
 
   <main>
 
-    <!-- ── URL Input ── -->
+    <!-- ── Upload Input ── -->
     <section class="input-section" id="inputSection">
       <div class="input-card">
-        <h2>Paste a YouTube song link to get the chords</h2>
+        <h2>Upload audio to analyze chords</h2>
+        <p class="helper-copy">Use your own audio file for chord analysis. Optional playback sources can be linked separately for review.</p>
         <div class="url-row">
-          <input
-            id="youtubeUrl"
-            type="text"
-            placeholder="https://www.youtube.com/watch?v=…"
-            autocomplete="off"
-            spellcheck="false"
-          />
+          <input id="audioFile" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*" />
+        </div>
+        <div class="url-row" style="margin-top:10px;">
+          <input id="songTitleInput" type="text" placeholder="Optional song title" autocomplete="off" spellcheck="false" />
           <button id="analyzeBtn">Analyze Chords</button>
         </div>
+        <div class="url-row" style="margin-top:10px;">
+          <input id="youtubeLinkInput" type="text" placeholder="Optional playback source URL (YouTube supported)" autocomplete="off" spellcheck="false" />
+          <button id="loadByYoutubeBtn">Load Saved Chords</button>
+        </div>
+        <label class="responsibility-check">
+          <input id="rightsConfirm" type="checkbox" />
+          <span>I have the rights or permission to upload this audio, and I will not upload copyrighted material without authorization.</span>
+        </label>
+        <p class="helper-copy helper-copy--muted">EZChords is a music analysis and learning tool. It does not convert videos to MP3 on your behalf.</p>
+        <div id="sourceWarning" class="source-warning hidden"></div>
 
-        <!-- Thumbnail preview (shown once a valid URL is detected) -->
+        <!-- Upload preview -->
         <div id="thumbPreview" class="thumb-preview hidden">
-          <img id="thumbImg" src="" alt="Video thumbnail" />
           <div class="thumb-meta">
-            <span class="thumb-label">Ready to analyze</span>
+            <span class="thumb-label" id="uploadLabel">No file selected</span>
           </div>
         </div>
-      </div>
-
-      <!-- Previously analyzed songs -->
-      <div id="cachedSection" class="cached-section hidden">
-        <h3 class="cached-heading">⚡ Previously analyzed — loads instantly</h3>
-        <div id="cachedList" class="cached-list"></div>
       </div>
     </section>
 
@@ -126,21 +127,23 @@
         </div>
       </div>
 
-      <!-- YouTube Player (audio-only, hidden video) -->
+      <!-- Audio player -->
       <div id="audioPlayerPanel" class="audio-player-panel">
-        <div id="yt-player"></div>
+        <div id="yt-player" class="hidden"></div>
         <div class="player-controls">
           <button id="playPauseBtn" class="play-pause-btn" title="Play / Pause">▶</button>
           <span id="timeDisplay" class="time-display">0:00 / 0:00</span>
           <input type="range" id="seekBar" class="seek-bar" min="0" max="100" value="0" step="0.1" />
         </div>
+        <audio id="uploadAudio" class="hidden" preload="metadata"></audio>
+        <p class="helper-copy helper-copy--muted">Playback source is optional and separate from stored chord analysis.</p>
       </div>
 
     </section>
 
   </main>
 
-  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/static/js/app.js"></script>
+  <script src="https://www.youtube.com/iframe_api"></script>
 </body>
 </html>
