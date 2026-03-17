@@ -21,16 +21,28 @@ DB_PATH    = os.path.join(os.path.dirname(__file__), 'cache.db')
 AUDIO_DIR  = os.path.join(os.path.dirname(__file__), 'static', 'audio')
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# YouTube cookies for authenticated downloads (avoids bot detection on cloud IPs)
+# ── YouTube authentication ─────────────────────────────────────────────────────
+# Priority: 1) cookies.txt on disk  2) Render secret mount  3) YT_COOKIES_B64 env var
+# Locally: if no cookie file exists, yt-dlp will use --cookies-from-browser (zero config)
 _COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 if not os.path.exists(_COOKIES_PATH):
     _COOKIES_PATH = '/etc/secrets/cookies.txt'  # Render secret file mount
-# If cookies are provided via env var (base64-encoded), write them to disk
 if not os.path.exists(_COOKIES_PATH) and os.environ.get('YT_COOKIES_B64'):
     import base64
     _COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
     with open(_COOKIES_PATH, 'wb') as f:
         f.write(base64.b64decode(os.environ['YT_COOKIES_B64']))
+
+_IS_LOCAL = os.environ.get('FLASK_ENV') != 'production'
+
+
+def _inject_yt_auth(opts: dict) -> None:
+    """Add cookie or browser auth to a yt-dlp options dict."""
+    if os.path.exists(_COOKIES_PATH):
+        opts['cookiefile'] = _COOKIES_PATH
+    elif _IS_LOCAL:
+        # Auto-read from Chrome — no manual export needed for local dev
+        opts['cookiesfrombrowser'] = ('chrome',)
 
 def _audio_path(video_id: str) -> str:
     return os.path.join(AUDIO_DIR, f'{video_id}.mp3')
@@ -578,8 +590,7 @@ def _process_job(job_id: str, url: str):
                 'no_warnings': True,
                 'noplaylist': True,
             }
-            if os.path.exists(_COOKIES_PATH):
-                ydl_opts['cookiefile'] = _COOKIES_PATH
+            _inject_yt_auth(ydl_opts)
 
             _set_job(job_id, message='Downloading audio from YouTube…', progress=10)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -628,8 +639,7 @@ def _process_job(job_id: str, url: str):
                         'no_warnings':       True,
                         'noplaylist':        True,
                     }
-                    if os.path.exists(_COOKIES_PATH):
-                        ydl_sub_opts['cookiefile'] = _COOKIES_PATH
+                    _inject_yt_auth(ydl_sub_opts)
                     with yt_dlp.YoutubeDL(ydl_sub_opts) as ydl:
                         ydl.download([url])
                     vtt_files = [os.path.join(subs_dir, f)
@@ -709,8 +719,7 @@ def _fetch_lyrics_job(video_id: str, url: str):
                     'outtmpl': os.path.join(subs_dir, '%(id)s.%(ext)s'),
                     'quiet': True, 'no_warnings': True, 'noplaylist': True,
                 }
-                if os.path.exists(_COOKIES_PATH):
-                    ydl_sub_opts['cookiefile'] = _COOKIES_PATH
+                _inject_yt_auth(ydl_sub_opts)
                 with yt_dlp.YoutubeDL(ydl_sub_opts) as ydl:
                     ydl.download([url])
                 vtt_files = [os.path.join(subs_dir, f)
