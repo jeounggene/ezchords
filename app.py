@@ -667,7 +667,9 @@ def _process_job(job_id: str, url: str):
             )
 
     except Exception as exc:
-        _set_job(job_id, status='error', message=str(exc))
+        import traceback
+        traceback.print_exc()
+        _set_job(job_id, status='error', message=f'Analysis failed: {exc}')
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

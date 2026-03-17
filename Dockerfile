@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# System deps: ffmpeg for audio, build tools for librosa/essentia
+# System deps: ffmpeg for audio, libsndfile for librosa
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
@@ -8,16 +8,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python deps
+# Install core Python deps (always needed)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir flask gunicorn yt-dlp librosa numpy scipy
+
+# Try to install essentia (may fail on some platforms — that's OK, librosa fallback works)
+RUN pip install --no-cache-dir essentia-tensorflow || echo "WARNING: essentia not available, using librosa fallback"
 
 # Copy app
 COPY . .
 
-# Essentia runs directly (no subprocess venv needed — we're on 3.12)
-# Create a symlink so the subprocess path resolves
-RUN mkdir -p .venv312/bin && ln -s /usr/local/bin/python .venv312/bin/python
+# If essentia installed, create symlink so subprocess finds python
+RUN mkdir -p .venv312/bin && ln -s $(which python) .venv312/bin/python
 
 # Writable dirs for cache and audio
 RUN mkdir -p static/audio
