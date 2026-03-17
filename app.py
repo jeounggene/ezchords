@@ -25,7 +25,7 @@ import numpy as np
 
 # Client fallback order — try least-restricted first
 _YT_CLIENTS = ['ANDROID_VR', 'IOS', 'ANDROID', 'WEB', 'TV', 'WEB_MUSIC', 'MWEB']
-_YT_MAX_RETRIES = 3          # retry the entire client chain this many times
+_YT_MAX_RETRIES = 2          # retry the entire client chain this many times
 _YT_BASE_DELAY  = 5          # seconds before first retry (doubled each round)
 
 
@@ -52,6 +52,52 @@ def _youtube(url: str) -> YouTube:
                 # Small pause between client switches to avoid hammering
                 time.sleep(1)
     raise RuntimeError(f'All YouTube clients failed. Last error: {last_err}')
+
+
+def _ytdlp_download(url: str, output_dir: str) -> tuple:
+    """Fallback: download audio via yt-dlp with browser cookies.
+    Returns (audio_file_path, title, author, duration) or raises."""
+    import shutil as _sh
+    ytdlp = _sh.which('yt-dlp')
+    if not ytdlp:
+        raise RuntimeError('yt-dlp not installed')
+
+    out_template = os.path.join(output_dir, '%(title)s.%(ext)s')
+    cmd = [
+        ytdlp,
+        '--cookies-from-browser', 'chrome',
+        '-x', '--audio-format', 'mp3',
+        '--audio-quality', '128K',
+        '-o', out_template,
+        '--print', 'after_move:filepath',
+        '--print', '%(title)s',
+        '--print', '%(uploader)s',
+        '--print', '%(duration)s',
+        '--no-playlist',
+        '--no-warnings',
+        url,
+    ]
+    print(f'[yt-dlp] fallback download: {url}')
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        raise RuntimeError(f'yt-dlp failed: {result.stderr[:200]}')
+
+    lines = result.stdout.strip().split('\n')
+    if len(lines) < 4:
+        raise RuntimeError(f'yt-dlp unexpected output: {result.stdout[:200]}')
+
+    filepath = lines[0]
+    title    = lines[1] or 'Unknown Song'
+    author   = lines[2] or ''
+    try:
+        duration = int(float(lines[3]))
+    except (ValueError, IndexError):
+        duration = None
+
+    if not os.path.exists(filepath):
+        raise RuntimeError(f'yt-dlp output file not found: {filepath}')
+
+    return filepath, title, author, duration
 
 app = Flask(__name__)
 
@@ -585,29 +631,37 @@ def _process_job(job_id: str, url: str):
             title = title_from_cache
         else:
             _set_job(job_id, message='Downloading audio from YouTube…', progress=10)
-            yt = _youtube(url)
-            title = yt.title or 'Unknown Song'
-            yt_author = yt.author or ''
-            yt_length = yt.length
 
-            # Pick best audio stream (prefer mp4/m4a for broad ffmpeg compat)
-            stream = (yt.streams.filter(only_audio=True, mime_type='audio/mp4')
-                        .order_by('abr').last()
-                      or yt.streams.filter(only_audio=True).order_by('abr').last())
-            if not stream:
-                raise RuntimeError('No audio stream available for this video.')
+            # Try pytubefix first, fall back to yt-dlp with browser cookies
+            try:
+                yt = _youtube(url)
+                title = yt.title or 'Unknown Song'
+                yt_author = yt.author or ''
+                yt_length = yt.length
 
-            tmp_audio = stream.download(output_path=tmp_dir, filename='audio')
+                stream = (yt.streams.filter(only_audio=True, mime_type='audio/mp4')
+                            .order_by('abr').last()
+                          or yt.streams.filter(only_audio=True).order_by('abr').last())
+                if not stream:
+                    raise RuntimeError('No audio stream available for this video.')
 
-            # Convert to mp3 via ffmpeg
-            tmp_mp3 = os.path.join(tmp_dir, 'audio.mp3')
-            subprocess.run(
-                ['ffmpeg', '-i', tmp_audio, '-vn', '-ar', '44100',
-                 '-ac', '2', '-b:a', '128k', tmp_mp3, '-y'],
-                capture_output=True, timeout=120,
-            )
-            if not os.path.exists(tmp_mp3):
-                raise RuntimeError('FFmpeg conversion to mp3 failed.')
+                tmp_audio = stream.download(output_path=tmp_dir, filename='audio')
+
+                tmp_mp3 = os.path.join(tmp_dir, 'audio.mp3')
+                subprocess.run(
+                    ['ffmpeg', '-i', tmp_audio, '-vn', '-ar', '44100',
+                     '-ac', '2', '-b:a', '128k', tmp_mp3, '-y'],
+                    capture_output=True, timeout=120,
+                )
+                if not os.path.exists(tmp_mp3):
+                    raise RuntimeError('FFmpeg conversion to mp3 failed.')
+
+            except Exception as ptf_err:
+                print(f'[download] pytubefix failed: {ptf_err}')
+                _set_job(job_id, message='Retrying download with yt-dlp…', progress=15)
+                tmp_mp3_path, title, yt_author, yt_length = _ytdlp_download(url, tmp_dir)
+                # yt-dlp already outputs mp3, just use it
+                tmp_mp3 = tmp_mp3_path
 
             shutil.copy2(tmp_mp3, mp3_dest)
 
