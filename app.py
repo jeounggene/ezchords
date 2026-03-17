@@ -23,6 +23,23 @@ from pytubefix import YouTube
 import librosa
 import numpy as np
 
+# Client fallback order — try least-restricted first
+_YT_CLIENTS = ['ANDROID_VR', 'IOS', 'ANDROID', 'WEB', 'TV', 'WEB_MUSIC', 'MWEB']
+
+
+def _youtube(url: str) -> YouTube:
+    """Create a YouTube object, trying multiple clients until one works."""
+    last_err = None
+    for client in _YT_CLIENTS:
+        try:
+            yt = YouTube(url, client=client)
+            _ = yt.title  # force metadata fetch to detect errors early
+            return yt
+        except Exception as e:
+            last_err = e
+            print(f'[pytubefix] client {client} failed: {str(e)[:80]}')
+    raise RuntimeError(f'All YouTube clients failed. Last error: {last_err}')
+
 app = Flask(__name__)
 
 DB_PATH    = os.path.join(os.path.dirname(__file__), 'cache.db')
@@ -555,7 +572,7 @@ def _process_job(job_id: str, url: str):
             title = title_from_cache
         else:
             _set_job(job_id, message='Downloading audio from YouTube…', progress=10)
-            yt = YouTube(url)
+            yt = _youtube(url)
             title = yt.title or 'Unknown Song'
             yt_author = yt.author or ''
             yt_length = yt.length
@@ -594,7 +611,7 @@ def _process_job(job_id: str, url: str):
             if not lyrics:
                 # Fallback: pytubefix captions
                 try:
-                    yt_obj = YouTube(url) if 'yt' not in dir() else yt
+                    yt_obj = _youtube(url) if 'yt' not in dir() else yt
                     lyrics = _fetch_captions_pytubefix(yt_obj)
                 except Exception as e:
                     print(f'[lyrics] caption fallback failed: {e}')
@@ -700,7 +717,7 @@ def _fetch_lyrics_job(video_id: str, url: str):
         lyrics = _fetch_lrclib(track or title, artist)
         if not lyrics:
             try:
-                yt_obj = YouTube(url)
+                yt_obj = _youtube(url)
                 lyrics = _fetch_captions_pytubefix(yt_obj)
             except Exception as e:
                 print(f'[lyrics] pytubefix caption fallback failed: {e}')
