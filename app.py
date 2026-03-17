@@ -815,5 +815,20 @@ def job_status(job_id):
     return jsonify(_get_job(job_id))
 
 
+@app.route('/api/health')
+def health():
+    """Quick diagnostic endpoint."""
+    import shutil
+    essentia_ok = os.path.exists(_VENV312_PYTHON)
+    ffmpeg_ok = shutil.which('ffmpeg') is not None
+    return jsonify({
+        'essentia_available': essentia_ok,
+        'ffmpeg_available': ffmpeg_ok,
+        'venv312_path': _VENV312_PYTHON,
+        'analyze_script': _ANALYZE_SCRIPT,
+        'audio_dir': AUDIO_DIR,
+    })
+
+
 if __name__ == '__main__':
     app.run(debug=True, port=5001, use_reloader=False)
