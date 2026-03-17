@@ -330,181 +330,143 @@ main {
    Chord Singalong Track
 ───────────────────────────────────────────── */
 .chord-section {
-  position: relative;
   background: #0a0a1a;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 0;
   overflow: hidden;
   margin-bottom: 24px;
-  /* Fixed height — prevents chord size changes from shifting lyrics/video */
-  height: 310px;
   flex-shrink: 0;
 }
 
-/* Fade edges */
-.chord-section::before,
-.chord-section::after {
-  content: '';
-  position: absolute;
-  top: 0; bottom: 0;
-  width: 120px;
-  z-index: 2;
-  pointer-events: none;
-}
-.chord-section::before {
-  left: 0;
-  background: linear-gradient(to right, #0a0a1a, transparent);
-}
-.chord-section::after {
-  right: 0;
-  background: linear-gradient(to left, #0a0a1a, transparent);
-}
-
-.chord-viewport {
-  overflow: hidden;
-  width: 100%;
-  height: 100%;
-  padding: 18px 0 14px;
-  /* Vertical centre-line marker */
+/* ── Scrolling timeline ── */
+.chord-timeline {
   position: relative;
+  height: 56px;   /* = PX_PER_BEAT in JS */
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid rgba(255,255,255,.07);
+  scrollbar-width: none;
 }
-.chord-viewport::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 0; bottom: 0;
-  width: 2px;
-  transform: translateX(-50%);
-  background: rgba(255,215,0,.15);
-  pointer-events: none;
-  z-index: 1;
-}
+.chord-timeline::-webkit-scrollbar { display: none; }
 
-.chord-row {
+.chord-tl-row {
   display: flex;
-  align-items: center;
-  will-change: transform;
-  transition: transform .32s cubic-bezier(.25,.46,.45,.94);
-  padding: 0 50%;
+  align-items: stretch;
+  height: 100%;
 }
 
-/* ── Individual chord items ── */
-.chord-item {
-  /* width set inline by JS based on duration */
-  flex: 0 0 auto;
-  min-width: 160px;
+/* Silent spacers that pad both sides so beat-0 starts centered */
+.beat-pad {
+  flex-shrink: 0;
+  width: 56px;
+  height: 100%;
+}
+
+/* Individual beat blocks */
+.beat-block {
+  flex-shrink: 0;
   position: relative;
+  width: 56px;          /* = PX_PER_BEAT in JS */
+  height: 100%;
+  border-right: 1px solid rgba(255,255,255,.09);
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-end;
+  overflow: visible;
+  cursor: pointer;
+  background: transparent;
+}
+.beat-block:hover { background: rgba(255,255,255,.06); }
+.beat-block.active {
+  background: rgba(255,255,255,.18);
+}
+.beat-block.measure-start {
+  border-left: 2px solid rgba(255,255,255,.32);
+}
+
+/* Chord name — visible only on the first beat of a chord group, overflows right */
+.beat-block-name {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  font-weight: 700;
+  font-size: 1rem;
+  line-height: 1;
+  color: rgba(255,255,255,.75);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
+}
+.beat-block.active .beat-block-name {
+  color: #fff;
+}
+
+/* ── 3-card diagram row ── */
+.chord-trio {
+  display: grid;
+  grid-template-columns: 1fr 1.6fr 1fr;
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+
+.chord-card {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  text-align: center;
+  padding: 12px 8px 8px;
+  border-radius: 8px;
+  background: rgba(255,255,255,.02);
+  border: 1px solid rgba(255,255,255,.06);
   cursor: pointer;
   user-select: none;
-  padding: 10px 6px 8px;
-  border-radius: 6px;
-  overflow: hidden;
-  /* divider line on the right edge */
-  border-right: 1px solid rgba(255,255,255,.09);
-  transition:
-    color .28s ease,
-    text-shadow .28s ease,
-    opacity .28s ease;
-  opacity: .16;
+  min-height: 48px;
+  transition: opacity .22s ease;
 }
 
-/* Inlaid time-fill: sweeps left→right showing how far through the chord we are */
-.chord-item::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: rgba(255,215,0,.13);
-  transform: scaleX(var(--fill, 0));
-  transform-origin: left center;
-  border-radius: inherit;
-  pointer-events: none;
-  z-index: 0;
+.chord-card--prev,
+.chord-card--next { opacity: .35; }
+
+.chord-card--active {
+  opacity: 1;
+  border-color: rgba(255,215,0,.35);
+  background: rgba(255,215,0,.05);
+  box-shadow: 0 0 24px rgba(255,165,0,.08);
 }
 
-.chord-item:hover { opacity: .42; }
-
-/* Name + duration labels sit above the fill */
-.chord-name {
-  position: relative;
-  z-index: 1;
+.chord-card .chord-name {
   font-weight: 700;
-  font-size: 1.1rem;
-  color: var(--chord-distant);
-  letter-spacing: -0.5px;
   line-height: 1;
-  transition: font-size .28s ease, color .28s ease, text-shadow .28s ease;
+  letter-spacing: -0.5px;
 }
-.chord-diagram {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  justify-content: center;
-  margin-top: 3px;
-  opacity: 0;
-  transition: opacity .28s ease;
-  /* always reserve space so layout stays stable */
-  width: 144px;
-  height: 154px;
-  overflow: hidden;
-}
-.chord-dur {
-  position: relative;
-  z-index: 1;
-  font-size: .68rem;
-  font-weight: 500;
-  color: transparent;   /* hidden by default */
-  margin-top: 4px;
-  letter-spacing: .02em;
-  transition: color .28s ease;
-  font-variant-numeric: tabular-nums;
-}
-
-/* Distance classes */
-.chord-item.near-2 .chord-name { font-size: 1.5rem; color: var(--chord-near2); }
-.chord-item.near-2              { opacity: .36; }
-
-.chord-item.near-1 .chord-name    { font-size: 2.2rem; color: var(--chord-near1); }
-.chord-item.near-1 .chord-diagram { opacity: .55; }
-.chord-item.near-1 .chord-dur     { color: var(--text-muted); }
-.chord-item.near-1                { opacity: .80; border-right-color: rgba(255,255,255,.18); }
-
-.chord-item.active .chord-name    {
-  font-size: 3.6rem;
+.chord-card--active .chord-name {
+  font-size: 3.2rem;
   color: var(--chord-active);
   text-shadow: var(--glow-active);
 }
-.chord-item.active .chord-diagram { opacity: 1; }
-.chord-item.active .chord-dur     { color: rgba(255,215,0,.55); }
-.chord-item.active                {
-  opacity: 1;
-  border-left: 2px solid rgba(255,215,0,.45);
-  border-right-color: rgba(255,215,0,.35);
+.chord-card--prev .chord-name,
+.chord-card--next .chord-name {
+  font-size: 1.8rem;
+  color: var(--chord-near1);
 }
+
+.chord-card .chord-diagram {
+  display: flex;
+  justify-content: center;
+  margin-top: 4px;
+}
+.chord-card--active .chord-diagram { opacity: 1; }
+.chord-card--prev .chord-diagram,
+.chord-card--next .chord-diagram   { opacity: .35; }
 
 /* Chord-change flash */
-@keyframes chordEnter {
-  0%   { transform: scale(.84); opacity: .5; }
-  55%  { transform: scale(1.06); }
+@keyframes cardEnter {
+  0%   { transform: scale(.88); opacity: .5; }
+  60%  { transform: scale(1.04); }
   100% { transform: scale(1);   opacity: 1; }
 }
-.chord-item.active.entering {
-  animation: chordEnter .3s cubic-bezier(.34,1.56,.64,1) forwards;
-}
-
-/* Beat pulse */
-@keyframes beatFlash {
-  0%   { }
-  35%  { text-shadow: 0 0 40px rgba(255,215,0,1), 0 0 90px rgba(255,165,0,.8); transform: scale(1.05); }
-  100% { }
-}
-.chord-item.active.beat .chord-name {
-  animation: beatFlash .22s ease-out;
+.chord-card--active.entering {
+  animation: cardEnter .28s cubic-bezier(.34,1.56,.64,1) forwards;
 }
 
 /* ─────────────────────────────────────────────
@@ -699,7 +661,13 @@ main {
 ───────────────────────────────────────────── */
 @media (max-width: 580px) {
   .input-card { padding: 24px 18px; }
-  .chord-item.near-1 .chord-name { font-size: 1.6rem; }
-  .chord-item.active .chord-name { font-size: 2.6rem; }
-  .chord-diagram { width: 125px; height: 132px; }
+  .beat-block { width: 44px; }
+  .chord-timeline { height: 44px; }
+  .beat-block-name { font-size: .85rem; }
+  .chord-trio { grid-template-columns: 1fr 1.5fr 1fr; gap: 5px; padding: 8px; }
+  .chord-card--active .chord-name { font-size: 2.4rem; }
+  .chord-card--prev .chord-name,
+  .chord-card--next .chord-name  { font-size: 1.4rem; }
+  .chord-card--prev .chord-diagram,
+  .chord-card--next .chord-diagram { display: none; }
 }

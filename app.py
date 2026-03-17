@@ -14,7 +14,6 @@ from flask import Flask, render_template, request, jsonify, send_file
 import yt_dlp
 import librosa
 import numpy as np
-from scipy.ndimage import median_filter
 
 app = Flask(__name__)
 
@@ -239,26 +238,81 @@ def _parse_vtt(path: str):
 
 
 # ─────────────────────────────────────────────
-# Chord templates (major + minor, 24 total)
+# Chord templates (major, minor, 7th, maj7, min7, sus2, sus4, dim, aug)
 # ─────────────────────────────────────────────
 NOTES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
 
+# (suffix, intervals) — used for both simple and extended templates
+SIMPLE_INTERVALS = [
+    ('',  [0, 4, 7]),        # major
+    ('m', [0, 3, 7]),        # minor
+]
 
-def _build_templates():
+EXTENDED_INTERVALS = [
+    ('7',    [0, 4, 7, 10]),  # dominant 7
+    ('m7',   [0, 3, 7, 10]),  # minor 7
+    ('maj7', [0, 4, 7, 11]),  # major 7
+    ('sus2', [0, 2, 7]),      # sus2
+    ('sus4', [0, 5, 7]),      # sus4
+    ('dim',  [0, 3, 6]),      # diminished
+    ('aug',  [0, 4, 8]),      # augmented
+]
+
+ALL_INTERVALS = SIMPLE_INTERVALS + EXTENDED_INTERVALS
+
+# Acoustic weighting: root 1.5×, fifth 1.2×, other intervals 1.0×
+ROOT_WEIGHT  = 1.5
+FIFTH_WEIGHT = 1.2
+
+
+def _build_templates(intervals_list):
+    """Build weighted chord templates from a list of (suffix, intervals)."""
     templates = {}
     for i, note in enumerate(NOTES):
-        for chord_type, intervals in [('', [0, 4, 7]), ('m', [0, 3, 7])]:
+        for chord_type, intervals in intervals_list:
             t = np.zeros(12)
-            for iv in intervals:
-                t[(i + iv) % 12] = 1.0
+            for k, iv in enumerate(intervals):
+                if k == 0:
+                    w = ROOT_WEIGHT   # root
+                elif iv in (7, 6, 8):
+                    w = FIFTH_WEIGHT  # fifth (or tritone/aug-5th acting as 5th)
+                else:
+                    w = 1.0
+                t[(i + iv) % 12] = w
             t /= np.linalg.norm(t)
             templates[note + chord_type] = t
     return templates
 
 
-CHORD_TEMPLATES = _build_templates()
-ALL_CHORDS = list(CHORD_TEMPLATES.keys())
-TEMPLATE_MATRIX = np.array([CHORD_TEMPLATES[c] for c in ALL_CHORDS])  # (24, 12)
+# Simple (major/minor only) — for pass-1
+SIMPLE_TEMPLATES  = _build_templates(SIMPLE_INTERVALS)
+SIMPLE_CHORDS     = list(SIMPLE_TEMPLATES.keys())
+SIMPLE_MATRIX     = np.array([SIMPLE_TEMPLATES[c] for c in SIMPLE_CHORDS])  # (24, 12)
+
+# Full (all 108) — for pass-2
+CHORD_TEMPLATES   = _build_templates(ALL_INTERVALS)
+ALL_CHORDS        = list(CHORD_TEMPLATES.keys())
+TEMPLATE_MATRIX   = np.array([CHORD_TEMPLATES[c] for c in ALL_CHORDS])      # (108, 12)
+
+# Map each extended chord to its simple parent (e.g. "Cm7" → "Cm", "Csus4" → "C")
+_EXTENDED_TO_SIMPLE = {}
+for i, note in enumerate(NOTES):
+    for suffix, _ in EXTENDED_INTERVALS:
+        parent = note + ('m' if 'm' in suffix and suffix != 'maj7' else '')
+        _EXTENDED_TO_SIMPLE[note + suffix] = parent
+
+# Diatonic chords for each key (major scale degrees I–VII)
+_DIATONIC_INTERVALS = [0, 2, 4, 5, 7, 9, 11]
+_DIATONIC_QUALITIES = ['', 'm', 'm', '', '', 'm', 'dim']
+
+
+def _diatonic_set(key_idx):
+    """Return set of chord names diatonic to the given major key."""
+    s = set()
+    for offset, quality in zip(_DIATONIC_INTERVALS, _DIATONIC_QUALITIES):
+        note = NOTES[(key_idx + offset) % 12]
+        s.add(note + quality)
+    return s
 
 # ─────────────────────────────────────────────
 # In-memory job store  (demo only — not for prod)
@@ -300,56 +354,136 @@ def extract_video_id(url: str):
 # Chord detection
 # ─────────────────────────────────────────────
 
+def _viterbi_decode(template_matrix, chord_list, beat_chroma, self_prob=0.92,
+                    emission_bias=None):
+    """Run Viterbi HMM over beat_chroma using the given templates.
+
+    template_matrix: (n_chords, 12)
+    chord_list:      list of chord names, length n_chords
+    beat_chroma:     (12, n_beats)
+    emission_bias:   optional (n_chords, 1) additive log-bias per chord
+    Returns: list of chord-name per beat.
+    """
+    n_chords = len(chord_list)
+    n_beats  = beat_chroma.shape[1]
+
+    # Cosine similarity → emission scores
+    norms = np.linalg.norm(beat_chroma, axis=0, keepdims=True)
+    norms[norms == 0] = 1.0
+    sim = template_matrix @ (beat_chroma / norms)  # (n_chords, n_beats)
+
+    log_emit = np.log(np.clip(sim, 1e-10, None))
+    if emission_bias is not None:
+        log_emit += emission_bias
+
+    # Transition matrix
+    switch_prob = (1.0 - self_prob) / max(n_chords - 1, 1)
+    log_self   = np.log(self_prob)
+    log_switch = np.log(switch_prob)
+
+    # Forward pass
+    viterbi = np.full((n_chords, n_beats), -np.inf)
+    backptr = np.zeros((n_chords, n_beats), dtype=int)
+    viterbi[:, 0] = np.log(1.0 / n_chords) + log_emit[:, 0]
+
+    for t in range(1, n_beats):
+        prev = viterbi[:, t - 1]
+        for s in range(n_chords):
+            candidates = prev + log_switch
+            candidates[s] = prev[s] + log_self
+            bp = int(np.argmax(candidates))
+            viterbi[s, t] = candidates[bp] + log_emit[s, t]
+            backptr[s, t] = bp
+
+    # Back-trace
+    path = np.zeros(n_beats, dtype=int)
+    path[-1] = int(np.argmax(viterbi[:, -1]))
+    for t in range(n_beats - 2, -1, -1):
+        path[t] = backptr[path[t + 1], t + 1]
+
+    return [chord_list[ci] for ci in path]
+
+
 def detect_chords(audio_path: str, hop_size: float = 0.5):
-    """Return (chords_list, bpm, key_string, beat_times_list)."""
+    """Return (chords_list, bpm, key_string, beat_times_list).
+
+    Pipeline:
+      1) HPSS → harmonic chroma (CENS) + percussive beat tracking
+      2) Beat-synchronous chroma
+      3) Key detection → diatonic emission bias
+      4) Pass-1: Viterbi HMM with 24 major/minor templates
+      5) Pass-2: Promote to extended chord only when score is significantly higher
+    """
     y, sr = librosa.load(audio_path, mono=True, sr=22050, duration=360)
 
-    hop_length = int(hop_size * sr)
+    hop_length = 2048  # ≈93 ms
 
-    # Separate harmonic / percussive
+    # ── HPSS ──
     y_harm, y_perc = librosa.effects.hpss(y)
 
-    # Chroma from harmonic component
-    chroma = librosa.feature.chroma_cqt(
+    # ── CENS chroma (Chroma Energy Normalized Statistics) ──
+    chroma = librosa.feature.chroma_cens(
         y=y_harm, sr=sr, hop_length=hop_length,
-        bins_per_octave=24, n_chroma=12,
+        n_chroma=12,
     )
 
-    # Temporal smoothing
-    chroma_smooth = median_filter(chroma, size=(1, 9))
-
-    # Beat tracking from percussive component
-    # librosa ≥0.10 returns tempo as a 1-element array; .item() handles both scalar and array
+    # ── Beat tracking from percussive ──
     tempo, beat_frames = librosa.beat.beat_track(y=y_perc, sr=sr, hop_length=hop_length)
     tempo = np.asarray(tempo).item()
     beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length).tolist()
 
-    # Detect tonal key (most prominent pitch class)
-    key_idx = int(np.argmax(np.mean(chroma_smooth, axis=1)))
+    # ── Beat-synchronous chroma ──
+    beat_chroma = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
+    n_beats = len(beat_times)
+    beat_chroma = beat_chroma[:, :n_beats]
+
+    # ── Key detection ──
+    key_idx = int(np.argmax(np.mean(beat_chroma, axis=1)))
     key = NOTES[key_idx]
+    diatonic = _diatonic_set(key_idx)
 
-    # Per-frame chord matching
-    raw = []
-    n_frames = chroma_smooth.shape[1]
-    for i in range(n_frames):
-        vec = chroma_smooth[:, i]
-        s = vec.sum()
-        if s > 0:
-            vec = vec / s
-        idx = int(np.argmax(TEMPLATE_MATRIX @ vec))
-        raw.append({
-            'chord': ALL_CHORDS[idx],
-            'start': round(i * hop_size, 3),
-            'end': round((i + 1) * hop_size, 3),
-        })
+    # ── Key-aware emission bias for simple chords (pass-1) ──
+    KEY_BOOST = 0.6  # log-space bonus for diatonic chords
+    simple_bias = np.zeros((len(SIMPLE_CHORDS), 1))
+    for ci, name in enumerate(SIMPLE_CHORDS):
+        if name in diatonic:
+            simple_bias[ci, 0] = KEY_BOOST
 
-    # Merge consecutive identical chords
+    # ── Pass-1: Viterbi with 24 major/minor templates ──
+    simple_path = _viterbi_decode(SIMPLE_MATRIX, SIMPLE_CHORDS, beat_chroma,
+                                  self_prob=0.92, emission_bias=simple_bias)
+
+    # ── Pass-2: Try to promote each beat to an extended chord ──
+    # Only upgrade if the extended template scores ≥ PROMOTE_THRESH higher
+    PROMOTE_THRESH = 0.12
+    norms = np.linalg.norm(beat_chroma, axis=0, keepdims=True)
+    norms[norms == 0] = 1.0
+    bc_normed = beat_chroma / norms
+    full_sim = TEMPLATE_MATRIX @ bc_normed  # (108, n_beats)
+
+    final_path = []
+    for bi, simple_name in enumerate(simple_path):
+        simple_score = full_sim[ALL_CHORDS.index(simple_name), bi]
+        # Check all extended variants that share the same root
+        best_ext_name  = simple_name
+        best_ext_score = simple_score
+        for ext_name, parent in _EXTENDED_TO_SIMPLE.items():
+            if parent == simple_name:
+                ext_score = full_sim[ALL_CHORDS.index(ext_name), bi]
+                if ext_score > best_ext_score + PROMOTE_THRESH:
+                    best_ext_name  = ext_name
+                    best_ext_score = ext_score
+        final_path.append(best_ext_name)
+
+    # ── Merge consecutive identical chords ──
     merged = []
-    for c in raw:
-        if merged and merged[-1]['chord'] == c['chord']:
-            merged[-1]['end'] = c['end']
+    for i, chord_name in enumerate(final_path):
+        start = beat_times[i]
+        end = beat_times[i + 1] if i + 1 < len(beat_times) else start + 0.5
+        if merged and merged[-1]['chord'] == chord_name:
+            merged[-1]['end'] = round(end, 3)
         else:
-            merged.append(dict(c))
+            merged.append({'chord': chord_name, 'start': round(start, 3), 'end': round(end, 3)})
 
     return merged, tempo, key, beat_times
 

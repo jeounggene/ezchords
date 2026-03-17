@@ -95,9 +95,25 @@
 
       <!-- Singalong chord track -->
       <div class="chord-section">
-        <div class="chord-viewport" id="chordViewport">
-          <div class="chord-row" id="chordRow">
-            <!-- Chord items injected by JS -->
+        <!-- Scrolling timeline -->
+        <div class="chord-timeline" id="chordTimeline">
+          <div class="chord-tl-row" id="tlRow">
+            <!-- chord blocks + beat markers injected by JS -->
+          </div>
+        </div>
+        <!-- Chord diagram cards (prev / current / next) -->
+        <div class="chord-trio">
+          <div class="chord-card chord-card--prev" id="cardPrev">
+            <span class="chord-name"></span>
+            <span class="chord-diagram"></span>
+          </div>
+          <div class="chord-card chord-card--active" id="cardActive">
+            <span class="chord-name"></span>
+            <span class="chord-diagram"></span>
+          </div>
+          <div class="chord-card chord-card--next" id="cardNext">
+            <span class="chord-name"></span>
+            <span class="chord-diagram"></span>
           </div>
         </div>
       </div>

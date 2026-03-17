@@ -28,20 +28,39 @@ let playbackRate   = 1.0;   // current playback speed
 let lyricsLines = [];       // [{text, start, end}, …] from server
 let lyricsIdx   = -1;       // index of currently displayed lyric line
 
-let currentIdx = -1;
-let beatIdx    = 0;
+let currentIdx     = -1;
+let currentBeatIdx = -1;
+let beatIdx        = 0;
 
 let rafId      = null;      // requestAnimationFrame handle
 let pollTimer  = null;      // setInterval handle for job polling
 
-// Pixels per second of chord duration — sets proportional item widths
-const PX_PER_SEC = 130;
-const MIN_W      = 160;   // wide enough for 144px diagram + padding
-const MAX_W      = 520;
+// Each beat is this many pixels wide in the timeline
+const PX_PER_BEAT = 56;
 
-function chordWidth(c) {
-  const dur = c.end - c.start;
-  return Math.min(MAX_W, Math.max(MIN_W, Math.round(dur * PX_PER_SEC)));
+// Build a beat-aligned chord sequence from raw chords + beat timestamps.
+// Returns [{chord, beatStart, beatCount}] where beatStart is an index into beatTimes.
+function buildBeatChords() {
+  if (!beatTimes.length || !chords.length) return [];
+  const result = [];
+  let bi = 0;
+  while (bi < beatTimes.length) {
+    const t = beatTimes[bi];
+    // Find which raw chord is active at the midpoint of this beat
+    const nextBt = beatTimes[bi + 1] ?? (t + (t - (beatTimes[bi - 1] ?? t - 0.5)));
+    const mid    = (t + nextBt) / 2;
+    const c      = chords.find(c => c.start <= mid && c.end > mid)
+                   ?? chords.find(c => c.start <= t && c.end > t)
+                   ?? chords[chords.length - 1];
+    // Merge consecutive same-chord beats
+    if (result.length && result[result.length - 1].chord === c.chord) {
+      result[result.length - 1].beatCount++;
+    } else {
+      result.push({ chord: c.chord, beatStart: bi, beatCount: 1 });
+    }
+    bi++;
+  }
+  return result;
 }
 
 function durLabel(c) {
@@ -123,13 +142,12 @@ function applyTranspose(steps) {
   if (baseKey) {
     document.getElementById('keyBadge').textContent = `Key: ${transposeChord(baseKey, steps)}`;
   }
-  // Re-label chord names and diagrams
-  document.querySelectorAll('#chordRow .chord-item').forEach((el, i) => {
-    const transposed = transposeChord(chords[i].chord, steps);
-    const nameEl = el.querySelector('.chord-name');
-    if (nameEl) nameEl.textContent = formatChord(transposed);
-    const diagEl = el.querySelector('.chord-diagram');
-    if (diagEl) diagEl.innerHTML = buildChordSVG(transposed);
+  if (currentIdx >= 0) _setCardContent_beatChord(currentIdx);
+  // Re-label beat-block name spans
+  document.querySelectorAll('#tlRow .beat-block-name').forEach(el => {
+    const bi = +el.closest('.beat-block').dataset.bi;
+    const gi = beatChords.findIndex(bc => bc.beatStart === bi);
+    if (gi >= 0) el.textContent = formatChord(transposeChord(beatChords[gi].chord, steps));
   });
 }
 
@@ -166,6 +184,110 @@ const CHORD_DIAGRAMS = {
   'Gb':  { f:[1,3,3,2,1,1],      b:2 },
   'Dbm': { f:[-1,1,3,3,2,1],     b:4 },
   'Gbm': { f:[1,3,3,1,1,1],      b:2 },
+
+  // ── Dominant 7 ──
+  'C7':   { f:[-1,3,2,3,1,0],    b:1 },
+  'C#7':  { f:[-1,1,3,1,3,1],    b:4 },
+  'D7':   { f:[-1,-1,0,2,1,2],   b:1 },
+  'Eb7':  { f:[-1,-1,1,3,2,3],   b:1 },
+  'E7':   { f:[0,2,0,1,0,0],     b:1 },
+  'F7':   { f:[1,3,1,2,1,1],     b:1 },
+  'F#7':  { f:[1,3,1,2,1,1],     b:2 },
+  'G7':   { f:[3,2,0,0,0,1],     b:1 },
+  'Ab7':  { f:[-1,-1,1,1,1,2],   b:1 },
+  'A7':   { f:[-1,0,2,0,2,0],    b:1 },
+  'Bb7':  { f:[-1,1,3,1,3,1],    b:1 },
+  'B7':   { f:[-1,2,1,2,0,2],    b:1 },
+  'Db7':  { f:[-1,1,3,1,3,1],    b:4 },
+  'Gb7':  { f:[1,3,1,2,1,1],     b:2 },
+
+  // ── Minor 7 ──
+  'Cm7':  { f:[-1,1,3,1,2,1],    b:3 },
+  'C#m7': { f:[-1,1,3,1,2,1],    b:4 },
+  'Dm7':  { f:[-1,-1,0,2,1,1],   b:1 },
+  'Ebm7': { f:[-1,-1,1,3,2,2],   b:1 },
+  'Em7':  { f:[0,2,0,0,0,0],     b:1 },
+  'Fm7':  { f:[1,3,1,1,1,1],     b:1 },
+  'F#m7': { f:[1,3,1,1,1,1],     b:2 },
+  'Gm7':  { f:[1,3,1,1,1,1],     b:3 },
+  'Abm7': { f:[1,3,1,1,1,1],     b:4 },
+  'Am7':  { f:[-1,0,2,0,1,0],    b:1 },
+  'Bbm7': { f:[-1,1,3,1,2,1],    b:1 },
+  'Bm7':  { f:[-1,2,0,2,0,2],    b:1 },
+  'Dbm7': { f:[-1,1,3,1,2,1],    b:4 },
+  'Gbm7': { f:[1,3,1,1,1,1],     b:2 },
+
+  // ── Major 7 ──
+  'Cmaj7':  { f:[-1,3,2,0,0,0],  b:1 },
+  'C#maj7': { f:[-1,1,3,2,3,1],  b:4 },
+  'Dmaj7':  { f:[-1,-1,0,2,2,2], b:1 },
+  'Ebmaj7': { f:[-1,-1,1,3,3,3], b:1 },
+  'Emaj7':  { f:[0,2,1,1,0,0],   b:1 },
+  'Fmaj7':  { f:[1,3,2,2,1,0],   b:1 },
+  'F#maj7': { f:[1,3,2,2,1,1],   b:2 },
+  'Gmaj7':  { f:[3,2,0,0,0,2],   b:1 },
+  'Abmaj7': { f:[-1,-1,1,1,1,3], b:1 },
+  'Amaj7':  { f:[-1,0,2,1,2,0],  b:1 },
+  'Bbmaj7': { f:[-1,1,3,2,3,1],  b:1 },
+  'Bmaj7':  { f:[-1,2,1,3,0,2],  b:1 },
+  'Dbmaj7': { f:[-1,1,3,2,3,1],  b:4 },
+  'Gbmaj7': { f:[1,3,2,2,1,1],   b:2 },
+
+  // ── Sus2 ──
+  'Csus2':  { f:[-1,3,0,0,1,3],  b:1 },
+  'C#sus2': { f:[-1,1,3,3,1,1],  b:4 },
+  'Dsus2':  { f:[-1,-1,0,2,3,0], b:1 },
+  'Ebsus2': { f:[-1,-1,1,3,4,1], b:1 },
+  'Esus2':  { f:[0,2,4,4,0,0],   b:1 },
+  'Fsus2':  { f:[-1,-1,3,0,1,1], b:1 },
+  'F#sus2': { f:[-1,1,3,3,1,1],  b:2 },
+  'Gsus2':  { f:[3,0,0,0,3,3],   b:1 },
+  'Absus2': { f:[-1,1,3,3,1,1],  b:4 },
+  'Asus2':  { f:[-1,0,2,2,0,0],  b:1 },
+  'Bbsus2': { f:[-1,1,3,3,1,1],  b:1 },
+  'Bsus2':  { f:[-1,2,4,4,2,2],  b:1 },
+
+  // ── Sus4 ──
+  'Csus4':  { f:[-1,3,3,0,1,1],  b:1 },
+  'C#sus4': { f:[-1,1,3,3,4,1],  b:4 },
+  'Dsus4':  { f:[-1,-1,0,2,3,3], b:1 },
+  'Ebsus4': { f:[-1,-1,1,3,4,4], b:1 },
+  'Esus4':  { f:[0,2,2,2,0,0],   b:1 },
+  'Fsus4':  { f:[1,3,3,3,1,1],   b:1 },
+  'F#sus4': { f:[1,3,3,3,1,1],   b:2 },
+  'Gsus4':  { f:[3,3,0,0,1,3],   b:1 },
+  'Absus4': { f:[1,3,3,3,1,1],   b:4 },
+  'Asus4':  { f:[-1,0,2,2,3,0],  b:1 },
+  'Bbsus4': { f:[-1,1,3,3,4,1],  b:1 },
+  'Bsus4':  { f:[-1,2,4,4,0,0],  b:1 },
+
+  // ── Diminished ──
+  'Cdim':  { f:[-1,3,4,2,4,-1],  b:1 },
+  'C#dim': { f:[-1,-1,2,3,2,3],  b:1 },
+  'Ddim':  { f:[-1,-1,0,1,3,1],  b:1 },
+  'Ebdim': { f:[-1,-1,1,2,4,2],  b:1 },
+  'Edim':  { f:[0,1,2,0,2,-1],   b:1 },
+  'Fdim':  { f:[-1,-1,3,1,0,1],  b:1 },
+  'F#dim': { f:[-1,-1,4,2,1,2],  b:1 },
+  'Gdim':  { f:[3,4,2,3,-1,-1],  b:1 },
+  'Abdim': { f:[4,2,0,1,-1,-1],  b:1 },
+  'Adim':  { f:[-1,0,1,2,1,-1],  b:1 },
+  'Bbdim': { f:[-1,1,2,3,2,-1],  b:1 },
+  'Bdim':  { f:[-1,2,3,4,3,-1],  b:1 },
+
+  // ── Augmented ──
+  'Caug':  { f:[-1,3,2,1,1,0],   b:1 },
+  'C#aug': { f:[-1,0,3,2,2,1],   b:1 },
+  'Daug':  { f:[-1,-1,0,3,3,2],  b:1 },
+  'Ebaug': { f:[-1,-1,1,0,0,3],  b:1 },
+  'Eaug':  { f:[0,3,2,1,1,0],    b:1 },
+  'Faug':  { f:[1,0,3,2,2,1],    b:1 },
+  'F#aug': { f:[-1,-1,4,3,3,2],  b:1 },
+  'Gaug':  { f:[3,2,1,0,0,3],    b:1 },
+  'Abaug': { f:[-1,-1,2,1,1,0],  b:1 },
+  'Aaug':  { f:[-1,0,3,2,2,1],   b:1 },
+  'Bbaug': { f:[-1,1,0,3,3,2],   b:1 },
+  'Baug':  { f:[-1,2,1,0,0,3],   b:1 },
 };
 
 function buildChordSVG(chordName) {
@@ -301,97 +423,130 @@ function _hideAudioPlayer() {
   el.src = '';
 }
 
-// ─── Chord Rendering ──────────────────────────────────────
+// ─── Timeline ────────────────────────────────────────────
 
-function renderChordRow(chordsData) {
-  const row = document.getElementById('chordRow');
+let beatChords   = [];  // [{chord, beatStart, beatCount}] — beat-aligned chord sequence
+
+function renderTimeline() {
+  const row = document.getElementById('tlRow');
   row.innerHTML = '';
-  chordsData.forEach((c, i) => {
+  if (!beatTimes.length) return;
+
+  beatChords = buildBeatChords();
+
+  // Build reverse lookup: beat index → chord group index
+  const beatToGroup = new Array(beatTimes.length).fill(-1);
+  beatChords.forEach((bc, gi) => {
+    for (let b = bc.beatStart; b < bc.beatStart + bc.beatCount; b++) beatToGroup[b] = gi;
+  });
+
+  // Pad both sides so beat 0 starts centered
+  const tlHalf = Math.ceil((document.getElementById('chordTimeline').offsetWidth || window.innerWidth) / 2 / PX_PER_BEAT);
+  const makePad = () => { const p = document.createElement('div'); p.className = 'beat-pad'; return p; };
+  for (let p = 0; p < tlHalf; p++) row.appendChild(makePad());
+
+  beatTimes.forEach((_, bi) => {
     const div = document.createElement('div');
-    div.className = 'chord-item';
-    const w = chordWidth(c);
-    div.style.width = w + 'px';
-    div.dataset.idx = i;
+    div.className = 'beat-block';
+    if (bi % 4 === 0) div.classList.add('measure-start');
+    div.dataset.bi = bi;
 
-    const transposed = transposeChord(c.chord, transposeSteps);
-
-    const name = document.createElement('span');
-    name.className   = 'chord-name';
-    name.textContent = formatChord(transposed);
-
-    const diag = document.createElement('span');
-    diag.className = 'chord-diagram';
-    diag.innerHTML = buildChordSVG(transposed);
-
-    const dur = document.createElement('span');
-    dur.className   = 'chord-dur';
-    dur.textContent = durLabel(c);
-
-    div.appendChild(name);
-    div.appendChild(diag);
-    div.appendChild(dur);
+    const gi = beatToGroup[bi];
+    const bc = beatChords[gi];
+    // Show chord name only on the first beat of each chord group
+    if (bc && bc.beatStart === bi) {
+      const name = document.createElement('span');
+      name.className   = 'beat-block-name';
+      name.textContent = formatChord(transposeChord(bc.chord, transposeSteps));
+      div.appendChild(name);
+    }
 
     div.addEventListener('click', () => {
-      if (audioEl) {
-        audioEl.currentTime = c.start;
-        audioEl.play();
-      } else if (ytPlayer && ytPlayer.seekTo) {
-        ytPlayer.seekTo(c.start, true);
-        ytPlayer.playVideo();
-      }
+      const t = beatTimes[bi];
+      if (audioEl) { audioEl.currentTime = t; audioEl.play(); }
+      else if (ytPlayer && ytPlayer.seekTo) { ytPlayer.seekTo(t, true); ytPlayer.playVideo(); }
     });
     row.appendChild(div);
   });
+
+  // Pad right side too
+  for (let p = 0; p < tlHalf; p++) row.appendChild(makePad());
 }
 
-// ─── Chord Track Animation ────────────────────────────────
+function _highlightBeat(bi) {
+  document.querySelectorAll('#tlRow .beat-block').forEach((el, i) => {
+    el.classList.toggle('active', i === bi);
+  });
+  const active = document.querySelector('#tlRow .beat-block.active');
+  if (active) active.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
+}
 
-function centerOnIndex(idx) {
-  const row      = document.getElementById('chordRow');
-  const viewport = document.getElementById('chordViewport');
-  const vpW      = viewport.clientWidth;
-  const items    = row.querySelectorAll('.chord-item');
-  if (!items[idx]) return;
-  const item   = items[idx];
-  let offset = -(item.offsetLeft + item.offsetWidth / 2 - vpW / 2);
-
-  // Always keep at least 80px of the next chord peeking in from the right
-  const PEEK = 80;
-  if (items[idx + 1]) {
-    const nextItem  = items[idx + 1];
-    const maxOffset = vpW - nextItem.offsetLeft - PEEK;
-    offset = Math.min(offset, maxOffset);
+function findBeatAt(t) {
+  let bi = 0;
+  for (let i = 0; i < beatTimes.length; i++) {
+    if (beatTimes[i] <= t) bi = i; else break;
   }
-
-  row.style.transform = `translateX(${offset}px)`;
+  return bi;
 }
 
-function applyDistanceClasses(centerIdx) {
-  const items = document.querySelectorAll('#chordRow .chord-item');
-  items.forEach((item, i) => {
-    const dist = i - centerIdx;
-    const abs  = Math.abs(dist);
-    item.classList.remove('active', 'near-1', 'near-2', 'entering', 'beat');
-    if      (abs === 0) item.classList.add('active');
-    else if (abs === 1) item.classList.add('near-1');
-    else if (abs === 2) item.classList.add('near-2');
+// Returns the index in beatChords for the given playback time t
+function findBeatChordAt(t) {
+  const bi = findBeatAt(t);
+  for (let i = 0; i < beatChords.length; i++) {
+    const bc = beatChords[i];
+    if (bi >= bc.beatStart && bi < bc.beatStart + bc.beatCount) return i;
+  }
+  return beatChords.length - 1;
+}
+
+// ─── Chord Cards (diagrams) ───────────────────────────────
+
+function _setCardContent(idx) {
+  [
+    { id: 'cardPrev',   i: idx - 1 },
+    { id: 'cardActive', i: idx     },
+    { id: 'cardNext',   i: idx + 1 },
+  ].forEach(({ id, i }) => {
+    const el = document.getElementById(id);
+    const c  = chords[i];
+    const t  = c ? transposeChord(c.chord, transposeSteps) : null;
+    el.querySelector('.chord-name').textContent  = t ? formatChord(t) : '';
+    el.querySelector('.chord-diagram').innerHTML = t ? buildChordSVG(t) : '';
   });
 }
 
-function triggerEnterAnimation() {
-  const active = document.querySelector('#chordRow .chord-item.active');
-  if (!active) return;
+function updateChordCards(beatChordIdx) {
+  _setCardContent_beatChord(beatChordIdx);
+  const active = document.getElementById('cardActive');
   active.classList.remove('entering');
-  void active.offsetWidth; // force reflow
+  void active.offsetWidth;
   active.classList.add('entering');
 }
 
-function triggerBeatPulse() {
-  const active = document.querySelector('#chordRow .chord-item.active');
-  if (!active) return;
-  active.classList.remove('beat');
-  void active.offsetWidth;
-  active.classList.add('beat');
+function _setCardContent_beatChord(bci) {
+  [
+    { id: 'cardPrev',   i: bci - 1 },
+    { id: 'cardActive', i: bci     },
+    { id: 'cardNext',   i: bci + 1 },
+  ].forEach(({ id, i }) => {
+    const el = document.getElementById(id);
+    const bc = beatChords[i];
+    const t  = bc ? transposeChord(bc.chord, transposeSteps) : null;
+    el.querySelector('.chord-name').textContent  = t ? formatChord(t) : '';
+    el.querySelector('.chord-diagram').innerHTML = t ? buildChordSVG(t) : '';
+  });
+}
+
+function _seekToChord(i) {
+  if (i < 0 || i >= chords.length) return;
+  const t = chords[i].start;
+  if (audioEl) {
+    audioEl.currentTime = t;
+    audioEl.play();
+  } else if (ytPlayer && ytPlayer.seekTo) {
+    ytPlayer.seekTo(t, true);
+    ytPlayer.playVideo();
+  }
 }
 
 // ─── Lyrics ───────────────────────────────────────────────
@@ -466,38 +621,22 @@ function trackLoop() {
     return;
   }
 
-  const idx = findChordAt(t);
-
-  // ── Beat pulse ──
-  while (beatIdx < beatTimes.length && beatTimes[beatIdx] <= t) {
-    triggerBeatPulse();
-    beatIdx++;
-  }
+  const chordIdx = findBeatChordAt(t);
+  const beatIdx2  = findBeatAt(t);
 
   // ── Lyrics ──
   updateLyrics(t);
 
-  // ── Active-chord fill (sweeps left→right inside the chord box) ──
-  if (idx >= 0) {
-    const chord    = chords[idx];
-    const elapsed  = t - chord.start;
-    const duration = chord.end - chord.start;
-    const fill     = Math.min(1, elapsed / duration);
-    const activeEl = document.querySelector('#chordRow .chord-item.active');
-    if (activeEl) activeEl.style.setProperty('--fill', fill);
+  // ── Beat highlight jumps every beat ──
+  if (beatIdx2 !== currentBeatIdx) {
+    currentBeatIdx = beatIdx2;
+    _highlightBeat(beatIdx2);
   }
 
-  // ── Chord changed ──
-  if (idx !== currentIdx) {
-    currentIdx = idx;
-    if (idx >= 0) {
-      applyDistanceClasses(idx);
-      // Reset fill on new active chord so sweep starts from zero
-      const newActive = document.querySelector('#chordRow .chord-item.active');
-      if (newActive) newActive.style.setProperty('--fill', '0');
-      centerOnIndex(idx);
-      triggerEnterAnimation();
-    }
+  // ── Chord changed → update diagram cards ──
+  if (chordIdx !== currentIdx) {
+    currentIdx = chordIdx;
+    if (chordIdx >= 0) updateChordCards(chordIdx);
   }
 
   rafId = requestAnimationFrame(trackLoop);
@@ -593,8 +732,9 @@ function loadResults(data) {
   baseKey   = data.key       || '';
   transposeSteps = 0;   // reset to original key for each new song
   playbackRate   = 1.0; // reset speed for each new song
-  currentIdx = -1;
-  beatIdx    = 0;
+  currentIdx     = -1;
+  currentBeatIdx = -1;
+  beatIdx        = 0;
 
   // Clear any previous lyrics poll
   if (_lyricsPollTimer) { clearTimeout(_lyricsPollTimer); _lyricsPollTimer = null; }
@@ -615,7 +755,10 @@ function loadResults(data) {
   document.getElementById('transposeLabel').textContent = 'Original key';
   setSpeed(1.0);
 
-  renderChordRow(chords);
+  renderTimeline();
+  if (beatChords.length > 0) {
+    _setCardContent_beatChord(0);
+  }
 
   showOnly('resultsSection');
 
@@ -685,6 +828,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const idx = SPEEDS.indexOf(playbackRate);
     if (idx < SPEEDS.length - 1) setSpeed(SPEEDS[idx + 1]);
   });
+
+  document.getElementById('cardPrev').addEventListener('click',   () => _seekToChord(currentIdx - 1));
+  document.getElementById('cardActive').addEventListener('click', () => _seekToChord(currentIdx));
+  document.getElementById('cardNext').addEventListener('click',   () => _seekToChord(currentIdx + 1));
 
   // Load cached songs list on page load
   loadCachedList();
