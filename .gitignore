@@ -18,6 +18,7 @@ env/
 # Flask / app data
 cache.db
 static/audio/
+cookies.txt
 
 # macOS
 .DS_Store
