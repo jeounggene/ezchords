@@ -10,7 +10,7 @@ WORKDIR /app
 
 # Install core Python deps (always needed)
 COPY requirements.txt .
-RUN pip install --no-cache-dir flask gunicorn yt-dlp librosa numpy scipy
+RUN pip install --no-cache-dir flask gunicorn pytubefix certifi librosa numpy scipy
 
 # Try to install essentia (may fail on some platforms — that's OK, librosa fallback works)
 RUN pip install --no-cache-dir essentia-tensorflow || echo "WARNING: essentia not available, using librosa fallback"

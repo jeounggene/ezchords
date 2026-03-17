@@ -7,11 +7,19 @@ import re
 import json
 import sqlite3
 import time
+import subprocess
 import urllib.request
 import urllib.parse
 
+# Fix macOS Python SSL (missing root certs)
+try:
+    import certifi
+    os.environ.setdefault('SSL_CERT_FILE', certifi.where())
+except ImportError:
+    pass
+
 from flask import Flask, render_template, request, jsonify, send_file
-import yt_dlp
+from pytubefix import YouTube
 import librosa
 import numpy as np
 
@@ -21,28 +29,6 @@ DB_PATH    = os.path.join(os.path.dirname(__file__), 'cache.db')
 AUDIO_DIR  = os.path.join(os.path.dirname(__file__), 'static', 'audio')
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# ── YouTube authentication ─────────────────────────────────────────────────────
-# Priority: 1) cookies.txt on disk  2) Render secret mount  3) YT_COOKIES_B64 env var
-# Locally: if no cookie file exists, yt-dlp will use --cookies-from-browser (zero config)
-_COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
-if not os.path.exists(_COOKIES_PATH):
-    _COOKIES_PATH = '/etc/secrets/cookies.txt'  # Render secret file mount
-if not os.path.exists(_COOKIES_PATH) and os.environ.get('YT_COOKIES_B64'):
-    import base64
-    _COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
-    with open(_COOKIES_PATH, 'wb') as f:
-        f.write(base64.b64decode(os.environ['YT_COOKIES_B64']))
-
-_IS_LOCAL = os.environ.get('FLASK_ENV') != 'production'
-
-
-def _inject_yt_auth(opts: dict) -> None:
-    """Add cookie or browser auth to a yt-dlp options dict."""
-    if os.path.exists(_COOKIES_PATH):
-        opts['cookiefile'] = _COOKIES_PATH
-    elif _IS_LOCAL:
-        # Auto-read from Chrome — no manual export needed for local dev
-        opts['cookiesfrombrowser'] = ('chrome',)
 
 def _audio_path(video_id: str) -> str:
     return os.path.join(AUDIO_DIR, f'{video_id}.mp3')
@@ -568,45 +554,31 @@ def _process_job(job_id: str, url: str):
             title_from_cache = (_cache_get(video_id) or {}).get('title', 'Unknown Song')
             title = title_from_cache
         else:
-            ydl_opts = {
-                'format': (
-                    'bestaudio[abr<=96]/bestaudio[abr<=128]'
-                    '/bestaudio[abr<=160]/bestaudio/best'
-                ),
-                # Download to tmp; we'll copy the mp3 to AUDIO_DIR after
-                'outtmpl': os.path.join(tmp_dir, 'audio.%(ext)s'),
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '128',
-                }],
-                'socket_timeout': 60,
-                'retries': 8,
-                'fragment_retries': 8,
-                'file_access_retries': 3,
-                'extractor_retries': 3,
-                'concurrent_fragment_downloads': 4,
-                'quiet': True,
-                'no_warnings': True,
-                'noplaylist': True,
-            }
-            _inject_yt_auth(ydl_opts)
-
             _set_job(job_id, message='Downloading audio from YouTube…', progress=10)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info  = ydl.extract_info(url, download=True)
-                title = info.get('title', 'Unknown Song')
+            yt = YouTube(url)
+            title = yt.title or 'Unknown Song'
+            yt_author = yt.author or ''
+            yt_length = yt.length
 
-            # Locate the mp3 yt-dlp produced
+            # Pick best audio stream (prefer mp4/m4a for broad ffmpeg compat)
+            stream = (yt.streams.filter(only_audio=True, mime_type='audio/mp4')
+                        .order_by('abr').last()
+                      or yt.streams.filter(only_audio=True).order_by('abr').last())
+            if not stream:
+                raise RuntimeError('No audio stream available for this video.')
+
+            tmp_audio = stream.download(output_path=tmp_dir, filename='audio')
+
+            # Convert to mp3 via ffmpeg
             tmp_mp3 = os.path.join(tmp_dir, 'audio.mp3')
+            subprocess.run(
+                ['ffmpeg', '-i', tmp_audio, '-vn', '-ar', '44100',
+                 '-ac', '2', '-b:a', '128k', tmp_mp3, '-y'],
+                capture_output=True, timeout=120,
+            )
             if not os.path.exists(tmp_mp3):
-                candidates = [f for f in os.listdir(tmp_dir)
-                              if os.path.isfile(os.path.join(tmp_dir, f))]
-                if not candidates:
-                    raise RuntimeError('No audio file found after download.')
-                tmp_mp3 = os.path.join(tmp_dir, candidates[0])
+                raise RuntimeError('FFmpeg conversion to mp3 failed.')
 
-            # Save permanently so the browser can stream it
             shutil.copy2(tmp_mp3, mp3_dest)
 
         # ── Fetch lyrics via LRCLIB (then fall back to YT subtitles) ──
@@ -615,39 +587,17 @@ def _process_job(job_id: str, url: str):
         if not lyrics:
             _set_job(job_id, message='Fetching lyrics…', progress=38)
             artist, track = _split_title(title)
-            # Try to use yt-dlp metadata if available
-            if 'info' in dir():
-                artist = info.get('artist') or info.get('uploader') or artist
-                track  = info.get('track')  or track or title
-                dur    = info.get('duration')
-            else:
-                dur = None
+            if 'yt_author' in dir():
+                artist = yt_author or artist
+            dur = yt_length if 'yt_length' in dir() else None
             lyrics = _fetch_lrclib(track or title, artist, dur)
             if not lyrics:
-                # Fallback: try YouTube auto-captions
-                subs_dir = os.path.join(tmp_dir, 'subs')
-                os.makedirs(subs_dir, exist_ok=True)
+                # Fallback: pytubefix captions
                 try:
-                    ydl_sub_opts = {
-                        'writesubtitles':    True,
-                        'writeautomaticsub': True,
-                        'subtitlesformat':   'vtt',
-                        'subtitleslangs':    ['en', 'en-US', 'en-GB'],
-                        'skip_download':     True,
-                        'outtmpl':           os.path.join(subs_dir, '%(id)s.%(ext)s'),
-                        'quiet':             True,
-                        'no_warnings':       True,
-                        'noplaylist':        True,
-                    }
-                    _inject_yt_auth(ydl_sub_opts)
-                    with yt_dlp.YoutubeDL(ydl_sub_opts) as ydl:
-                        ydl.download([url])
-                    vtt_files = [os.path.join(subs_dir, f)
-                                 for f in os.listdir(subs_dir) if f.endswith('.vtt')]
-                    if vtt_files:
-                        lyrics = _parse_vtt(vtt_files[0])
+                    yt_obj = YouTube(url) if 'yt' not in dir() else yt
+                    lyrics = _fetch_captions_pytubefix(yt_obj)
                 except Exception as e:
-                    print(f'[lyrics] subtitle fallback failed: {e}')
+                    print(f'[lyrics] caption fallback failed: {e}')
 
         _set_job(job_id, message='Analyzing chords (this takes ~30–60 s)…', progress=40)
 
@@ -699,6 +649,46 @@ def _process_job(job_id: str, url: str):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _fetch_captions_pytubefix(yt_obj) -> list:
+    """Extract English captions from a pytubefix YouTube object → [{text, start, end}, ...]."""
+    cap = None
+    for code in ['en', 'a.en', 'en-US', 'en-GB']:
+        cap = yt_obj.captions.get(code)
+        if cap:
+            break
+    if not cap:
+        return []
+    srt = cap.generate_srt_captions()
+    return _parse_srt(srt)
+
+
+def _parse_srt(srt_text: str) -> list:
+    """Parse SRT text → [{text, start, end}, ...]."""
+    blocks = re.split(r'\n{2,}', srt_text.strip())
+    cues = []
+    ts_re = re.compile(r'(\d+:\d+:\d+[,.]\d+)\s*-->\s*(\d+:\d+:\d+[,.]\d+)')
+    for block in blocks:
+        lines = block.strip().splitlines()
+        m = None
+        text_parts = []
+        for ln in lines:
+            mt = ts_re.search(ln)
+            if mt:
+                m = mt
+                text_parts = []
+            elif m and ln.strip() and not ln.strip().isdigit():
+                text_parts.append(re.sub(r'<[^>]+>', '', ln.strip()))
+        if not m or not text_parts:
+            continue
+        def _ts(s):
+            p = s.replace(',', '.').split(':')
+            return round(int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2]), 3)
+        text = re.sub(r'[♪♫]', '', ' '.join(text_parts)).strip()
+        if text:
+            cues.append({'text': text, 'start': _ts(m.group(1)), 'end': _ts(m.group(2))})
+    return cues
+
+
 def _fetch_lyrics_job(video_id: str, url: str):
     """Background job: fetch lyrics via LRCLIB (fallback: YT captions) and update SQLite."""
     try:
@@ -709,25 +699,11 @@ def _fetch_lyrics_job(video_id: str, url: str):
         artist, track = _split_title(title)
         lyrics = _fetch_lrclib(track or title, artist)
         if not lyrics:
-            # Fallback: YouTube auto-captions
-            subs_dir = tempfile.mkdtemp()
             try:
-                ydl_sub_opts = {
-                    'writesubtitles': True, 'writeautomaticsub': True,
-                    'subtitlesformat': 'vtt', 'subtitleslangs': ['en', 'en-US', 'en-GB'],
-                    'skip_download': True,
-                    'outtmpl': os.path.join(subs_dir, '%(id)s.%(ext)s'),
-                    'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                }
-                _inject_yt_auth(ydl_sub_opts)
-                with yt_dlp.YoutubeDL(ydl_sub_opts) as ydl:
-                    ydl.download([url])
-                vtt_files = [os.path.join(subs_dir, f)
-                             for f in os.listdir(subs_dir) if f.endswith('.vtt')]
-                if vtt_files:
-                    lyrics = _parse_vtt(vtt_files[0])
-            finally:
-                shutil.rmtree(subs_dir, ignore_errors=True)
+                yt_obj = YouTube(url)
+                lyrics = _fetch_captions_pytubefix(yt_obj)
+            except Exception as e:
+                print(f'[lyrics] pytubefix caption fallback failed: {e}')
         if lyrics:
             _cache_put(video_id, cached['title'], cached['key'], cached['bpm'],
                        cached['chords'], cached['beat_times'], lyrics)
@@ -844,14 +820,11 @@ def job_status(job_id):
 @app.route('/api/health')
 def health():
     """Quick diagnostic endpoint."""
-    import shutil
     essentia_ok = os.path.exists(_VENV312_PYTHON)
     ffmpeg_ok = shutil.which('ffmpeg') is not None
     return jsonify({
         'essentia_available': essentia_ok,
         'ffmpeg_available': ffmpeg_ok,
-        'cookies_available': os.path.exists(_COOKIES_PATH),
-        'cookies_path': _COOKIES_PATH,
         'venv312_path': _VENV312_PYTHON,
         'analyze_script': _ANALYZE_SCRIPT,
         'audio_dir': AUDIO_DIR,
