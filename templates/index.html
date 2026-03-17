@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EZChords – Singalong Chord Player</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <!-- YouTube IFrame API must load before app.js defines the ready callback -->
+  <script src="https://www.youtube.com/iframe_api"></script>
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="site-header">
+    <div class="header-inner">
+      <span class="logo">🎸 EZChords</span>
+      <span class="tagline">Singalong chord player for any YouTube song</span>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ── URL Input ── -->
+    <section class="input-section" id="inputSection">
+      <div class="input-card">
+        <h2>Paste a YouTube song link to get the chords</h2>
+        <div class="url-row">
+          <input
+            id="youtubeUrl"
+            type="text"
+            placeholder="https://www.youtube.com/watch?v=…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button id="analyzeBtn">Analyze Chords</button>
+        </div>
+
+        <!-- Thumbnail preview (shown once a valid URL is detected) -->
+        <div id="thumbPreview" class="thumb-preview hidden">
+          <img id="thumbImg" src="" alt="Video thumbnail" />
+          <div class="thumb-meta">
+            <span class="thumb-label">Ready to analyze</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Previously analyzed songs -->
+      <div id="cachedSection" class="cached-section hidden">
+        <h3 class="cached-heading">⚡ Previously analyzed — loads instantly</h3>
+        <div id="cachedList" class="cached-list"></div>
+      </div>
+    </section>
+
+    <!-- ── Loading ── -->
+    <section id="loadingSection" class="loading-section hidden">
+      <div class="spinner"></div>
+      <p id="loadingMessage" class="loading-msg">Starting…</p>
+      <div class="progress-outer">
+        <div class="progress-inner" id="loadingProgress" style="width:0%"></div>
+      </div>
+      <p class="loading-sub">Chord analysis usually takes 30–90 seconds</p>
+    </section>
+
+    <!-- ── Error ── -->
+    <section id="errorSection" class="error-section hidden">
+      <div class="error-card">
+        <span class="error-icon">⚠️</span>
+        <p id="errorMessage">An error occurred.</p>
+        <button id="retryBtn">Try Another Song</button>
+      </div>
+    </section>
+
+    <!-- ── Results ── -->
+    <section id="resultsSection" class="results-section hidden">
+
+      <!-- Song info bar -->
+      <div class="song-info-bar">
+        <span class="song-title" id="songTitle">—</span>
+        <div class="song-badges">
+          <span class="badge badge-key" id="keyBadge">Key: —</span>
+          <span class="badge badge-bpm" id="bpmBadge">BPM: —</span>
+        </div>
+        <div class="transpose-ctrl">
+          <button class="transpose-btn" id="transposeDown" title="Down one semitone">▼</button>
+          <span class="transpose-label" id="transposeLabel">Original key</span>
+          <button class="transpose-btn" id="transposeUp" title="Up one semitone">▲</button>
+        </div>
+        <div class="transpose-ctrl">
+          <button class="transpose-btn" id="speedDown" title="Slower">▼</button>
+          <span class="transpose-label" id="speedLabel">Normal speed</span>
+          <button class="transpose-btn" id="speedUp" title="Faster">▲</button>
+        </div>
+        <button class="new-song-btn" id="newSongBtn">← New Song</button>
+      </div>
+
+      <!-- Singalong chord track -->
+      <div class="chord-section">
+        <div class="chord-viewport" id="chordViewport">
+          <div class="chord-row" id="chordRow">
+            <!-- Chord items injected by JS -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Lyrics -->
+      <div id="lyricsSection" class="lyrics-section hidden">
+        <div class="lyric lyric-prev" id="lyricPrev"></div>
+        <div class="lyric lyric-active" id="lyricActive">♪</div>
+        <div class="lyric lyric-next" id="lyricNext"></div>
+      </div>
+        </div>
+      </div>
+
+      <!-- Embedded YouTube player -->
+      <div class="player-wrapper" id="playerWrapper">
+        <div id="yt-player"></div>
+      </div>
+
+      <!-- Fallback when embedding is blocked by video owner -->
+      <div id="audioPlayerPanel" class="audio-player-panel hidden">
+        <div class="ap-header">
+          <span class="ap-icon">🎵</span>
+          <span class="ap-label">Audio playback (video embedding disabled by uploader)</span>
+          <a id="apYtLink" href="#" target="_blank" rel="noopener" class="ap-yt-link">▶ Watch on YouTube</a>
+        </div>
+        <audio id="audioEl" controls preload="auto"></audio>
+      </div>
+
+    </section>
+
+  </main>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
