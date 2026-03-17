@@ -12,7 +12,8 @@
 'use strict';
 
 // ─── State ────────────────────────────────────────────────
-let audioEl        = null;   // <audio> element for playback
+let ytPlayer       = null;   // YT.Player instance
+let ytReady        = false;  // true once onPlayerReady fires
 let currentVideoId = null;
 
 let chords     = [];        // [{chord, start, end}, …]
@@ -130,7 +131,7 @@ const SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5];
 
 function setSpeed(rate) {
   playbackRate = rate;
-  if (audioEl) audioEl.playbackRate = rate;
+  if (ytPlayer && ytReady) ytPlayer.setPlaybackRate(rate);
   document.getElementById('speedLabel').textContent =
     rate === 1 ? 'Normal speed' : `Speed: ${rate}×`;
 }
@@ -360,21 +361,110 @@ function showOnly(sectionId) {
   });
 }
 
-// ─── Audio Player ─────────────────────────────────────────
+// ─── YouTube IFrame Player ────────────────────────────────
 
-function initAudioPlayer(videoId) {
+// Called automatically by the YouTube IFrame API once loaded.
+// We may call initYTPlayer() before or after this fires, so we use a flag.
+let ytAPIReady = false;
+window.onYouTubeIframeAPIReady = function () {
+  ytAPIReady = true;
+  if (currentVideoId) _createPlayer(currentVideoId);
+};
+
+function initYTPlayer(videoId) {
   currentVideoId = videoId;
-  audioEl = document.getElementById('audioEl');
-  const src = `/api/audio/${videoId}`;
-  audioEl.src = src;
-  audioEl.playbackRate = playbackRate;
+  ytReady = false;
 
-  audioEl.addEventListener('play',  () => startTracking(), { once: false });
-  audioEl.addEventListener('pause', () => stopTracking(),  { once: false });
-  audioEl.addEventListener('ended', () => stopTracking(),  { once: false });
-  audioEl.addEventListener('seeked', () => { currentIdx = -1; beatIdx = 0; }, { once: false });
+  // Destroy any previous player instance
+  if (ytPlayer) { try { ytPlayer.destroy(); } catch (_) {} ytPlayer = null; }
 
-  audioEl.play().catch(() => {});
+  // Ensure the target div exists (YT.Player.destroy removes it)
+  _ensurePlayerDiv();
+
+  // Update custom controls
+  document.getElementById('playPauseBtn').textContent = '▶';
+  document.getElementById('timeDisplay').textContent = '0:00 / 0:00';
+  document.getElementById('seekBar').value = 0;
+
+  if (ytAPIReady) {
+    _createPlayer(videoId);
+  }
+  // else: onYouTubeIframeAPIReady will call _createPlayer once the API loads
+}
+
+function _ensurePlayerDiv() {
+  if (document.getElementById('yt-player')) return;
+  const panel = document.getElementById('audioPlayerPanel');
+  const controls = panel.querySelector('.player-controls');
+  const div = document.createElement('div');
+  div.id = 'yt-player';
+  panel.insertBefore(div, controls);
+}
+
+function _createPlayer(videoId) {
+  ytPlayer = new YT.Player('yt-player', {
+    videoId: videoId,
+    height: '0',
+    width: '0',
+    playerVars: {
+      autoplay: 1,
+      controls: 0,
+      disablekb: 1,
+      fs: 0,
+      modestbranding: 1,
+      rel: 0,
+      playsinline: 1,
+    },
+    events: {
+      onReady: _onPlayerReady,
+      onStateChange: _onPlayerStateChange,
+    },
+  });
+}
+
+function _onPlayerReady(event) {
+  ytReady = true;
+  event.target.setPlaybackRate(playbackRate);
+  event.target.playVideo();
+  startTracking();
+
+  // Update seek bar range
+  const dur = event.target.getDuration();
+  document.getElementById('seekBar').max = dur;
+}
+
+function _onPlayerStateChange(event) {
+  const btn = document.getElementById('playPauseBtn');
+  if (event.data === YT.PlayerState.PLAYING) {
+    btn.textContent = '⏸';
+    startTracking();
+  } else if (event.data === YT.PlayerState.PAUSED) {
+    btn.textContent = '▶';
+  } else if (event.data === YT.PlayerState.ENDED) {
+    btn.textContent = '▶';
+    stopTracking();
+  }
+}
+
+// Helper: current playback time (safe to call even when player not ready)
+function _currentTime() {
+  if (ytPlayer && ytReady && typeof ytPlayer.getCurrentTime === 'function') {
+    return ytPlayer.getCurrentTime();
+  }
+  return 0;
+}
+
+function _duration() {
+  if (ytPlayer && ytReady && typeof ytPlayer.getDuration === 'function') {
+    return ytPlayer.getDuration();
+  }
+  return 0;
+}
+
+function _fmtTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return m + ':' + (sec < 10 ? '0' : '') + sec;
 }
 
 // ─── Timeline ────────────────────────────────────────────
@@ -417,7 +507,7 @@ function renderTimeline() {
 
     div.addEventListener('click', () => {
       const t = beatTimes[bi];
-      if (audioEl) { audioEl.currentTime = t; audioEl.play(); }
+      if (ytPlayer && ytReady) { ytPlayer.seekTo(t, true); ytPlayer.playVideo(); }
     });
     row.appendChild(div);
   });
@@ -493,9 +583,9 @@ function _setCardContent_beatChord(bci) {
 function _seekToChord(i) {
   if (i < 0 || i >= chords.length) return;
   const t = chords[i].start;
-  if (audioEl) {
-    audioEl.currentTime = t;
-    audioEl.play();
+  if (ytPlayer && ytReady) {
+    ytPlayer.seekTo(t, true);
+    ytPlayer.playVideo();
   }
 }
 
@@ -561,13 +651,24 @@ function findChordAt(t) {
 }
 
 function trackLoop() {
-  let t;
-  if (audioEl && !audioEl.paused) {
-    t = audioEl.currentTime;
-  } else {
+  if (!ytPlayer || !ytReady) {
     rafId = requestAnimationFrame(trackLoop);
     return;
   }
+
+  // Only sync while playing
+  const state = ytPlayer.getPlayerState();
+  if (state !== YT.PlayerState.PLAYING) {
+    rafId = requestAnimationFrame(trackLoop);
+    return;
+  }
+
+  const t = _currentTime();
+
+  // ── Update custom seek bar + time display ──
+  const dur = _duration();
+  document.getElementById('seekBar').value = t;
+  document.getElementById('timeDisplay').textContent = _fmtTime(t) + ' / ' + _fmtTime(dur);
 
   const chordIdx = findBeatChordAt(t);
   const beatIdx2  = findBeatAt(t);
@@ -593,8 +694,8 @@ function trackLoop() {
 function startTracking() {
   stopTracking();
   beatIdx = 0;
-  if (audioEl) {
-    const t = audioEl.currentTime;
+  if (ytPlayer && ytReady) {
+    const t = _currentTime();
     while (beatIdx < beatTimes.length && beatTimes[beatIdx] < t) beatIdx++;
   }
   rafId = requestAnimationFrame(trackLoop);
@@ -709,8 +810,8 @@ function loadResults(data) {
 
   showOnly('resultsSection');
 
-  // Init audio player
-  initAudioPlayer(data.video_id);
+  // Init YouTube player
+  initYTPlayer(data.video_id);
 }
 
 // ─── UI Helpers ───────────────────────────────────────────
@@ -724,11 +825,12 @@ function resetToInput() {
   stopTracking();
   stopPolling();
   if (_lyricsPollTimer) { clearTimeout(_lyricsPollTimer); _lyricsPollTimer = null; }
-  if (audioEl) { audioEl.pause(); audioEl.src = ''; }
-  audioEl = null;
+  if (ytPlayer) { try { ytPlayer.destroy(); } catch (_) {} ytPlayer = null; }
+  ytReady = false;
   chords = []; beatTimes = []; currentIdx = -1;
   lyricsLines = []; lyricsIdx = -1;
   document.getElementById('lyricsSection').classList.add('hidden');
+  _ensurePlayerDiv();
   showOnly('inputSection');
   loadCachedList();
 }
@@ -775,6 +877,22 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('cardPrev').addEventListener('click',   () => _seekToChord(currentIdx - 1));
   document.getElementById('cardActive').addEventListener('click', () => _seekToChord(currentIdx));
   document.getElementById('cardNext').addEventListener('click',   () => _seekToChord(currentIdx + 1));
+
+  // Custom player controls
+  document.getElementById('playPauseBtn').addEventListener('click', () => {
+    if (!ytPlayer || !ytReady) return;
+    const state = ytPlayer.getPlayerState();
+    if (state === YT.PlayerState.PLAYING) {
+      ytPlayer.pauseVideo();
+    } else {
+      ytPlayer.playVideo();
+    }
+  });
+
+  const seekBar = document.getElementById('seekBar');
+  seekBar.addEventListener('input', () => {
+    if (ytPlayer && ytReady) ytPlayer.seekTo(Number(seekBar.value), true);
+  });
 
   // Load cached songs list on page load
   loadCachedList();
